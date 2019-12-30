@@ -1,13 +1,44 @@
-version: 1.0.{build}
-install:
-- git clone https://github.com/ebekker/letsencrypt-win.git
-#- nuget restore letsencrypt-win\letsencrypt-win.sln
-- nuget restore letsencrypt-win-simple.sln
-- cp -R packages letsencrypt-win
-build:
-  project: letsencrypt-win-simple.sln
-  verbosity: minimal
-artifacts:
-- path: letsencrypt-win-simple\bin\debug
-  name: letsencrypt-win-simple
-  type: zip
+version: 2.1.2.{build}
+image: Visual Studio 2019
+platform: Any CPU
+shallow_clone: true
+dotnet_csproj:
+  patch: true
+  file: '**\*.csproj'
+  version: '{version}'
+  assembly_version: '{version}'
+  file_version: '{version}'
+environment:
+  PfxPassword:
+    secure: tC3u6WA0oWdjXzbLX61Ux2tBK0KhFTT9FgUZFn0Nx0pY045twcsFBvRL+Di6SE80Nc88xaM/xloHGUAQoIq4OANLNg0BEsDYPnhziZDiLBo=
+clone_script:
+  - cmd: >-
+      git clone -q --branch=%APPVEYOR_REPO_BRANCH% https://github.com/%APPVEYOR_REPO_NAME%.git %APPVEYOR_BUILD_FOLDER%
+      && cd %APPVEYOR_BUILD_FOLDER%
+      && git checkout -qf %APPVEYOR_REPO_COMMIT%
+      && git submodule update --init --recursive
+before_build:
+  - cmd: dotnet --version
+build_script:
+  - cmd: dotnet publish ./src/main/wacs.csproj -c "Release" -r win-x64 /p:PublishSingleFile=true /p:PublishTrimmed=true
+  - cmd: dotnet publish ./src/main/wacs.csproj -c "Release" -r win-x86 /p:PublishSingleFile=true /p:PublishTrimmed=true
+  - cmd: dotnet publish ./src/main/wacs.csproj -c "ReleasePluggable" -r win-x64 /p:PublishSingleFile=true
+  - cmd: dotnet publish ./src/main/wacs.csproj -c "ReleasePluggable" -r win-x86 /p:PublishSingleFile=true
+  - cmd: dotnet publish ./src/plugin.validation.dns.azure/wacs.validation.dns.azure.csproj -c Release
+  - cmd: dotnet publish ./src/plugin.validation.dns.dreamhost/wacs.validation.dns.dreamhost.csproj -c Release
+  - cmd: dotnet publish ./src/plugin.validation.dns.route53/wacs.validation.dns.route53.csproj -c Release
+test_script:
+  - cmd: cd %APPVEYOR_BUILD_FOLDER%/src/main.test/
+  - cmd: nuget install Appveyor.TestLogger -Version 2.0.0
+  - cmd: cd %APPVEYOR_BUILD_FOLDER%
+  - cmd: dotnet test ./src/main.test/wacs.test.csproj -c Release --test-adapter-path:. --logger:Appveyor 
+after_build:
+- ps: >-
+    cd $env:APPVEYOR_BUILD_FOLDER\build\
+
+    .\create-artifacts.ps1 $env:APPVEYOR_BUILD_FOLDER $env:APPVEYOR_BUILD_VERSION $env:PfxPassword
+
+    Get-ChildItem $env:APPVEYOR_BUILD_FOLDER\build\artifacts\ | Foreach-Object {
+        Push-AppveyorArtifact $_.FullName -FileName $_.Name
+    }
+deploy: off
