@@ -1,32 +1,40 @@
-﻿using PKISharp.WACS.DomainObjects;
+﻿using PKISharp.WACS.Configuration;
 using PKISharp.WACS.Plugins.Base.Factories;
 using PKISharp.WACS.Services;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Plugins.ValidationPlugins.Http
 {
-    internal class SelfHostingOptionsFactory : ValidationPluginOptionsFactory<SelfHosting, SelfHostingOptions>
+    internal class SelfHostingOptionsFactory : PluginOptionsFactory<SelfHostingOptions>
     {
-        private readonly IArgumentsService _arguments;
-        private readonly UserRoleService _userRoleService;
+        private readonly ArgumentsInputService _arguments;
 
-        public SelfHostingOptionsFactory(IArgumentsService arguments, UserRoleService userRoleService)
-        {
+        private ArgumentResult<int?> ValidationPort =>
+            _arguments.GetInt<SelfHostingArguments>(x => x.ValidationPort);
+
+        private ArgumentResult<string?> ValidationProtocol =>
+            _arguments.GetString<SelfHostingArguments>(x => x.ValidationProtocol);
+
+        public SelfHostingOptionsFactory(ArgumentsInputService arguments) => 
             _arguments = arguments;
-            _userRoleService = userRoleService;
-        }
 
-        public override bool Disabled => SelfHosting.IsDisabled(_userRoleService);
-
-        public override Task<SelfHostingOptions?> Aquire(Target target, IInputService inputService, RunLevel runLevel) => Default(target);
-
-        public override async Task<SelfHostingOptions?> Default(Target target)
+        public override async Task<SelfHostingOptions?> Default()
         {
-            var args = _arguments.GetArguments<SelfHostingArguments>();
             return new SelfHostingOptions()
             {
-                Port = args.ValidationPort
+                Port = await ValidationPort.GetValue(),
+                Https = (await ValidationProtocol.GetValue())?.ToLower() == "https" ? true : null
             };
+        }
+
+        public override IEnumerable<(CommandLineAttribute, object?)> Describe(SelfHostingOptions options)
+        {
+            yield return (ValidationPort.Meta, options.Port);
+            if (options.Https == true) 
+            {
+                yield return (ValidationProtocol.Meta, "https");
+            }
         }
     }
 }

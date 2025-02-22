@@ -1,23 +1,23 @@
-﻿using ACMESharp.Protocol;
-using ACMESharp.Protocol.Resources;
-using Autofac;
-using PKISharp.WACS.Acme;
-using PKISharp.WACS.Configuration;
+﻿using Autofac;
+using Autofac.Core;
+using PKISharp.WACS.Clients;
+using PKISharp.WACS.Clients.Acme;
+using PKISharp.WACS.Configuration.Arguments;
+using PKISharp.WACS.Context;
 using PKISharp.WACS.DomainObjects;
 using PKISharp.WACS.Extensions;
+using PKISharp.WACS.Plugins.Base;
 using PKISharp.WACS.Plugins.Base.Options;
 using PKISharp.WACS.Plugins.Interfaces;
 using PKISharp.WACS.Services;
-using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS
 {
     /// <summary>
-    /// This part of the code handles the actual creation/renewal of ACME certificates
+    /// This part of the code handles the actual creation/renewal 
     /// </summary>
     internal class RenewalExecutor
     {
@@ -26,411 +26,275 @@ namespace PKISharp.WACS
         private readonly ILifetimeScope _container;
         private readonly ILogService _log;
         private readonly IInputService _input;
-        private readonly ExceptionHandler _exceptionHandler;
+        private readonly ISettingsService _settings;
+        private readonly DueDateStaticService _dueDateStatic;
+        private readonly DueDateRuntimeService _dueDateRuntime;
+        private readonly TaskSchedulerService _taskScheduler;
+        private readonly AcmeClientManager _clientManager;
 
         public RenewalExecutor(
-            MainArguments args, IAutofacBuilder scopeBuilder,
-            ILogService log, IInputService input,
-            ExceptionHandler exceptionHandler, IContainer container)
+            MainArguments args,
+            IAutofacBuilder scopeBuilder,
+            ILogService log,
+            IInputService input,
+            ISettingsService settings,
+            DueDateStaticService dueDateStatic,
+            DueDateRuntimeService dueDateRuntime,
+            TaskSchedulerService taskScheduler,
+            AcmeClientManager clientManager,
+            ISharingLifetimeScope container)
         {
             _args = args;
             _scopeBuilder = scopeBuilder;
             _log = log;
             _input = input;
-            _exceptionHandler = exceptionHandler;
+            _settings = settings;
             _container = container;
+            _dueDateStatic = dueDateStatic;
+            _dueDateRuntime = dueDateRuntime;
+            _taskScheduler = taskScheduler;
+            _clientManager = clientManager;
         }
 
-        public async Task<RenewResult?> Renew(Renewal renewal, RunLevel runLevel)
+        /// <summary>
+        /// Determine if the renewal should be executed
+        /// </summary>
+        /// <param name="renewal"></param>
+        /// <param name="runLevel"></param>
+        /// <returns></returns>
+        public async Task<RenewResult> HandleRenewal(Renewal renewal, RunLevel runLevel)
         {
-            using var ts = _scopeBuilder.Target(_container, renewal, runLevel);
-            using var es = _scopeBuilder.Execution(ts, renewal, runLevel);
-            // Generate the target
-            var targetPlugin = es.Resolve<ITargetPlugin>();
-            if (targetPlugin.Disabled)
+            _input.CreateSpace();
+            _log.Reset();
+
+            // Check the initial, combined target for the renewal
+            var client = await _clientManager.GetClient(renewal.Account);
+            using var es = _scopeBuilder.Execution(_container, renewal, client, runLevel);
+            var targetPlugin = es.Resolve<PluginBackend<ITargetPlugin, IPluginCapability, TargetPluginOptions>>();
+            if (targetPlugin.Capability.State.Disabled)
             {
-                throw new Exception($"Target plugin is not available to the current user, try running as administrator");
+                return new RenewResult($"Source plugin {targetPlugin.Meta.Name} is disabled. {targetPlugin.Capability.State.Reason}");
             }
-            var target = await targetPlugin.Generate();
+            var target = await targetPlugin.Backend.Generate();
             if (target == null)
             {
-                throw new Exception($"Target plugin did not generate a target");
+                _log.Information("Plugin {targetPluginName} did not generate a source", targetPlugin.Meta.Name);
+                return new RenewResult($"Plugin {targetPlugin.Meta.Name} did not generate a source");
             }
-            if (!target.IsValid(_log))
+            _log.Information("Plugin {targetPluginName} generated source {common} with {n} identifiers",
+                targetPlugin.Meta.Name, 
+                target.DisplayName.Value,
+                target.Parts.SelectMany(p => p.Identifiers).Distinct().Count());
+
+            // Create one or more orders from the target
+            var targetScope = _scopeBuilder.Split(es, target);
+            var orderPlugin = targetScope.Resolve<PluginBackend<IOrderPlugin, IPluginCapability, OrderPluginOptions>>();
+            var orders = orderPlugin.Backend.Split(renewal, target).ToList();
+            if (orders == null || !orders.Any())
             {
-                throw new Exception($"Target plugin generated an invalid target");
+                return new RenewResult($"Order plugin {orderPlugin.Meta.Name} failed to create order(s)");
+            }
+            _log.Information($"Plugin {{order}} created {{n}} order{(orders.Count > 1?"s":"")}", orderPlugin.Meta.Name, orders.Count);
+            foreach (var order in orders)
+            {
+                if (!order.Target.IsValid(_log))
+                {
+                    var blame = orders.Count > 1 ? "Order" : "Source";
+                    var blamePlugin = orders.Count > 1 ? orderPlugin.Meta : targetPlugin.Meta;
+                    return new RenewResult($"{blame} plugin {blamePlugin.Name} created invalid source");
+                }
             }
 
-            // Check if our validation plugin is (still) up to the task
-            var validationPlugin = es.Resolve<IValidationPluginOptionsFactory>();
-            if (!validationPlugin.CanValidate(target))
-            {
-                throw new Exception($"Validation plugin is unable to validate the target. A wildcard host was introduced into a HTTP validated renewal.");
-            }
-
-            // Check if renewal is needed
-            if (!runLevel.HasFlag(RunLevel.ForceRenew) && !renewal.Updated)
+            // Logging
+            if (!runLevel.HasFlag(RunLevel.Force) && !renewal.Updated)
             {
                 _log.Verbose("Checking {renewal}", renewal.LastFriendlyName);
-                if (!renewal.IsDue())
-                {
-                    var cs = es.Resolve<ICertificateService>();
-                    var cache = cs.CachedInfo(renewal, target);
-                    if (cache != null)
-                    {
-                        _log.Information(LogType.All, "Renewal for {renewal} is due after {date}", renewal.LastFriendlyName, renewal.GetDueDate());
-                        return null;
-                    }
-                    else if (!renewal.New)
-                    {
-                        _log.Information(LogType.All, "Renewal for {renewal} running prematurely due to detected target change", renewal.LastFriendlyName);
-                    }
-                }
-                else if (!renewal.New)
-                {
-                    _log.Information(LogType.All, "Renewing certificate for {renewal}", renewal.LastFriendlyName);
-                }
             }
-            else if (runLevel.HasFlag(RunLevel.ForceRenew))
+            else if (runLevel.HasFlag(RunLevel.Force))
             {
-                _log.Information(LogType.All, "Force renewing certificate for {renewal}", renewal.LastFriendlyName);
+                _log.Information(LogType.All, "Force renewing {renewal}", renewal.LastFriendlyName);
             }
 
-            // Create the order
-            var client = es.Resolve<AcmeClient>();
-            var identifiers = target.GetHosts(false);
-            var order = await client.CreateOrder(identifiers);
+            // Handle the orders
+            var result = await HandleOrders(es, renewal, orders, runLevel);
 
-            // Check if the order is valid
-            if (order.Payload.Status != AcmeClient.OrderReady &&
-                order.Payload.Status != AcmeClient.OrderPending)
-            {
-                return OnRenewFail(new Challenge() { Error = order.Payload.Error });
-            }
-
-            // Answer the challenges
-            foreach (var authUrl in order.Payload.Authorizations)
-            {
-                // Get authorization details
-                var authorization = await client.GetAuthorizationDetails(authUrl);
-
-                // Find a targetPart that matches the challenge
-                var targetPart = target.Parts.
-                    FirstOrDefault(tp => tp.GetHosts(false).
-                    Any(h => authorization.Identifier.Value == h.Replace("*.", "")));
-                if (targetPart == null)
-                {
-                    return OnRenewFail(new Challenge()
-                    {
-                        Error = "Unable to match challenge to target"
-                    });
-                }
-
-                // Run the validation plugin
-                var challenge = await Authorize(es, runLevel, renewal.ValidationPluginOptions, targetPart, authorization);
-                if (challenge.Status != AcmeClient.AuthorizationValid)
-                {
-                    return OnRenewFail(challenge);
-                }
-            }
-            return await OnValidationSuccess(es, renewal, target, order, runLevel);
-        }
-
-        /// <summary>
-        /// Steps to take on authorization failed
-        /// </summary>
-        /// <param name="auth"></param>
-        /// <returns></returns>
-        private RenewResult OnRenewFail(Challenge challenge)
-        {
-            var errors = challenge?.Error;
-            if (errors != null)
-            {
-                _log.Error("ACME server reported:");
-                _log.Error("{@value}", errors);
-            }
-            return new RenewResult("Authorization failed");
-
-        }
-
-        /// <summary>
-        /// Steps to take on succesful (re)authorization
-        /// </summary>
-        /// <param name="target"></param>
-        private async Task<RenewResult> OnValidationSuccess(ILifetimeScope renewalScope, Renewal renewal, Target target, OrderDetails order, RunLevel runLevel)
-        {
-            RenewResult? result = null;
-            try
-            {
-                var certificateService = renewalScope.Resolve<ICertificateService>();
-                var csrPlugin = target.CsrBytes == null ? renewalScope.Resolve<ICsrPlugin>() : null;
-                if (csrPlugin != null && csrPlugin.Disabled)
-                {
-                    return new RenewResult("CSR plugin is not available to the current user, try running as administrator");
-                }
-                var oldCertificate = certificateService.CachedInfo(renewal);
-                var newCertificate = await certificateService.RequestCertificate(csrPlugin, runLevel, renewal, target, order);
-
-                // Test if a new certificate has been generated 
-                if (newCertificate == null)
-                {
-                    return new RenewResult("No certificate generated");
-                }
-                else
-                {
-                    result = new RenewResult(newCertificate);
-                }
-
-                // Early escape for testing validation only
-                if (renewal.New &&
-                    runLevel.HasFlag(RunLevel.Test) &&
-                    !await _input.PromptYesNo($"[--test] Do you want to install the certificate?", true))
-                {
-                    return new RenewResult("User aborted");
-                }
-
-                // Run store plugin(s)
-                var storePluginOptions = new List<StorePluginOptions>();
-                var storePlugins = new List<IStorePlugin>();
-                try
-                {
-                    var steps = renewal.StorePluginOptions.Count();
-                    for (var i = 0; i < steps; i++)
-                    {
-                        var storeOptions = renewal.StorePluginOptions[i];
-                        var storePlugin = (IStorePlugin)renewalScope.Resolve(storeOptions.Instance);
-                        if (!(storePlugin is INull))
-                        {
-                            if (steps > 1)
-                            {
-                                _log.Information("Store step {n}/{m}: {name}...", i + 1, steps, storeOptions.Name);
-                            }
-                            else
-                            {
-                                _log.Information("Store with {name}...", storeOptions.Name);
-                            }
-                            if (storePlugin.Disabled)
-                            {
-                                return new RenewResult("Store plugin is not available to the current user, try running as administrator");
-                            }
-                            await storePlugin.Save(newCertificate);
-                            storePlugins.Add(storePlugin);
-                            storePluginOptions.Add(storeOptions);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    var reason = _exceptionHandler.HandleException(ex, "Unable to store certificate");
-                    result.ErrorMessage = $"Store failed: {reason}";
-                    result.Success = false;
-                    return result;
-                }
-
-                // Run installation plugin(s)
-                try
-                {
-                    var steps = renewal.InstallationPluginOptions.Count();
-                    for (var i = 0; i < steps; i++)
-                    {
-                        var installOptions = renewal.InstallationPluginOptions[i];
-                        var installPlugin = (IInstallationPlugin)renewalScope.Resolve(
-                            installOptions.Instance,
-                            new TypedParameter(installOptions.GetType(), installOptions));
-
-                        if (!(installPlugin is INull))
-                        {
-                            if (steps > 1)
-                            {
-                                _log.Information("Installation step {n}/{m}: {name}...", i + 1, steps, installOptions.Name);
-                            }
-                            else
-                            {
-                                _log.Information("Installing with {name}...", installOptions.Name);
-                            }
-                            if (installPlugin.Disabled)
-                            {
-                                return new RenewResult("Installation plugin is not available to the current user, try running as administrator");
-                            }
-                            await installPlugin.Install(storePlugins, newCertificate, oldCertificate);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    var reason = _exceptionHandler.HandleException(ex, "Unable to install certificate");
-                    result.Success = false;
-                    result.ErrorMessage = $"Install failed: {reason}";
-                }
-
-                // Delete the old certificate if not forbidden, found and not re-used
-                for (var i = 0; i < storePluginOptions.Count; i++)
-                {
-                    if (!storePluginOptions[i].KeepExisting &&
-                        oldCertificate != null &&
-                        newCertificate.Certificate.Thumbprint != oldCertificate.Certificate.Thumbprint)
-                    {
-                        try
-                        {
-                            await storePlugins[i].Delete(oldCertificate);
-                        }
-                        catch (Exception ex)
-                        {
-                            _log.Error(ex, "Unable to delete previous certificate");
-                            //result.Success = false; // not a show-stopper, consider the renewal a success
-                            result.ErrorMessage = $"Delete failed: {ex.Message}";
-                        }
-                    }
-                }
-
-                if ((renewal.New || renewal.Updated) && !_args.NoTaskScheduler)
-                {
-                    if (runLevel.HasFlag(RunLevel.Test) &&
-                        !await _input.PromptYesNo($"[--test] Do you want to automatically renew this certificate?", true))
-                    {
-                        // Early out for test runs
-                        return new RenewResult("User aborted");
-                    }
-                    else
-                    {
-                        // Make sure the Task Scheduler is configured
-                        await renewalScope.Resolve<TaskSchedulerService>().EnsureTaskScheduler(runLevel);
-                    }
-                }
-
-                return result;
-            }
-            catch (Exception ex)
-            {
-                _exceptionHandler.HandleException(ex);
-                while (ex.InnerException != null)
-                {
-                    ex = ex.InnerException;
-                }
-
-                // Result might still contain the Thumbprint of the certificate 
-                // that was requested and (partially? installed, which might help
-                // with debugging
-                if (result == null)
-                {
-                    result = new RenewResult(ex.Message);
-                }
-                else
-                {
-                    result.Success = false;
-                    result.ErrorMessage = ex.Message;
-                }
-            }
+            // Manage the task scheduler
+            await ManageTaskScheduler(renewal, result, runLevel);
 
             return result;
         }
 
         /// <summary>
-        /// Make sure we have authorization for every host in target
+        /// Optionally ensure the task scheduler, depending on renewal result and 
+        /// various other switches and settings.
         /// </summary>
-        /// <param name="target"></param>
+        /// <param name="renewal"></param>
+        /// <param name="result"></param>
+        /// <param name="runLevel"></param>
         /// <returns></returns>
-        private async Task<Challenge> Authorize(
-            ILifetimeScope execute, RunLevel runLevel,
-            ValidationPluginOptions options, TargetPart targetPart,
-            Authorization authorization)
+        private async Task ManageTaskScheduler(Renewal renewal, RenewResult result, RunLevel runLevel)
         {
-            var invalid = new Challenge { Status = AcmeClient.AuthorizationInvalid };
-            var valid = new Challenge { Status = AcmeClient.AuthorizationValid };
-            var client = execute.Resolve<AcmeClient>();
-            var identifier = authorization.Identifier.Value;
-            try
+            // Configure task scheduler
+            var setupTaskScheduler = _args.SetupTaskScheduler;
+            if (!setupTaskScheduler && !_args.NoTaskScheduler)
             {
-                _log.Information("Authorize identifier: {identifier}", identifier);
-                if (authorization.Status == AcmeClient.AuthorizationValid &&
-                    !runLevel.HasFlag(RunLevel.Test) &&
-                    !runLevel.HasFlag(RunLevel.IgnoreCache))
+                setupTaskScheduler = result.Success == true && !result.Abort && (renewal.New || renewal.Updated);
+            }
+            if (setupTaskScheduler && runLevel.HasFlag(RunLevel.Test))
+            {
+                setupTaskScheduler = await _input.PromptYesNo($"[--test] Do you want to automatically renew with these settings?", true);
+                if (!setupTaskScheduler)
                 {
-                    _log.Information("Cached authorization result: {Status}", authorization.Status);
-                    return valid;
+                    result.Abort = true;
+                }
+            }
+            if (setupTaskScheduler)
+            {
+                var taskLevel = runLevel;
+                if (_args.SetupTaskScheduler)
+                {
+                    taskLevel |= RunLevel.Force;
+                }
+                await _taskScheduler.EnsureTaskScheduler(taskLevel);
+            }
+        }
+
+        /// <summary>
+        /// Return abort result
+        /// </summary>
+        /// <param name="renewal"></param>
+        /// <returns></returns>
+        private RenewResult Abort(Renewal renewal, RenewResult result)
+        {
+            var dueDate = _dueDateStatic.DueDate(renewal);
+            if (dueDate != null)
+            {
+                // For sure now that we don't need to run so abort this execution
+                _log.Information("Renewal {renewal} is due after {date}", renewal.LastFriendlyName, _input.FormatDate(dueDate.Start));
+            }
+            result.Abort = true;
+            return result;
+        }
+
+        /// <summary>
+        /// Run the renewal 
+        /// </summary>
+        /// <param name="execute"></param>
+        /// <param name="orders"></param>
+        /// <param name="runLevel"></param>
+        /// <returns></returns>
+        private async Task<RenewResult> HandleOrders(ILifetimeScope execute, Renewal renewal, List<Order> orders, RunLevel runLevel)
+        {
+            // Return value
+            var result = new RenewResult() { OrderResults = new List<OrderResult>() };
+
+            // Get the certificates from cache or server
+            var orderProcessor = execute.Resolve<OrderProcessor>();
+
+            // Build context
+            var previousOrders = _dueDateStatic.CurrentOrders(renewal);
+            var orderContexts = orders.Select(order => new OrderContext(_scopeBuilder.Order(execute, order), order, runLevel)).ToList();
+            await orderProcessor.PrepareOrders(orderContexts, previousOrders);
+
+            // Check individual orders
+            foreach (var o in orderContexts)
+            {
+                if (o.ShouldRun)
+                {
+                    _log.Verbose("Order {name} should run (new/changed source)", o.OrderFriendlyName);
+                }
+                else if (runLevel.HasFlag(RunLevel.Force))
+                {
+                    o.ShouldRun = true;
+                    _log.Verbose("Order {name} should run (forced)", o.OrderFriendlyName);
+                }
+                else if (_dueDateRuntime.ShouldRun(o))
+                {
+                    o.ShouldRun = true;
+                    _log.Verbose("Order {name} should run (due for renewal)", o.OrderFriendlyName);
                 }
                 else
                 {
-                    using var validation = _scopeBuilder.Validation(execute, options, targetPart, identifier);
-                    IValidationPlugin? validationPlugin = null;
-                    try
-                    {
-                        validationPlugin = validation.Resolve<IValidationPlugin>();
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.Error(ex, "Error resolving validation plugin");
-                    }
-                    if (validationPlugin == null)
-                    {
-                        _log.Error("Validation plugin not found or not created.");
-                        return invalid;
-                    }
-                    if (validationPlugin.Disabled)
-                    {
-                        _log.Error("Validation plugin is not available to the current user, try running as administrator.");
-                        return invalid;
-                    }
-                    var challenge = authorization.Challenges.FirstOrDefault(c => c.Type == options.ChallengeType);
-                    if (challenge == null)
-                    {
-                        _log.Error("Expected challenge type {type} not available for {identifier}.",
-                            options.ChallengeType,
-                            authorization.Identifier.Value);
-                        return invalid;
-                    }
-
-                    if (challenge.Status == AcmeClient.AuthorizationValid &&
-                        !runLevel.HasFlag(RunLevel.Test) &&
-                        !runLevel.HasFlag(RunLevel.IgnoreCache))
-                    {
-                        _log.Information("{dnsIdentifier} already validated by {challengeType} validation ({name})",
-                             authorization.Identifier.Value,
-                             options.ChallengeType,
-                             options.Name);
-                        return valid;
-                    }
-
-                    _log.Information("Authorizing {dnsIdentifier} using {challengeType} validation ({name})",
-                        identifier,
-                        options.ChallengeType,
-                        options.Name);
-                    try
-                    {
-                        var details = await client.DecodeChallengeValidation(authorization, challenge);
-                        await validationPlugin.PrepareChallenge(details);
-                    }
-                    catch (Exception ex)
-                    {
-                        _log.Error(ex, "Error preparing for challenge answer");
-                        return invalid;
-                    }
-
-                    _log.Debug("Submitting challenge answer");
-                    challenge = await client.AnswerChallenge(challenge);
-
-                    if (challenge.Status != AcmeClient.AuthorizationValid)
-                    {
-                        if (challenge.Error != null)
-                        {
-                            _log.Error(challenge.Error.ToString());
-                        }
-                        _log.Error("Authorization result: {Status}", challenge.Status);
-                        return invalid;
-                    }
-                    else
-                    {
-                        _log.Information("Authorization result: {Status}", challenge.Status);
-                        return valid;
-                    }
+                    _log.Verbose("Order {name} should not run this time", o.OrderFriendlyName);
                 }
             }
-            catch (Exception ex)
+
+            // Check missing orders
+            var missingOrders = previousOrders.Where(x => !orderContexts.Any(c => c.OrderCacheKey == x.Key));
+            if (missingOrders.Any())
             {
-                _log.Error("Error authorizing {renewal}", targetPart);
-                _exceptionHandler.HandleException(ex);
-                return invalid;
+                foreach (var order in missingOrders)
+                {
+                    // This order was previously included in the set
+                    // but has now disappeared, i.e. because bindings
+                    // in IIS have changed or a new CSR was placed.
+                    // We will note this in the renewal history, so that
+                    // we won't take them into account anymore in the
+                    // DueDateStaticService.
+                    result.OrderResults.Add(new OrderResult(order.Key) { Missing = true });
+                }
             }
+
+            // Only process orders that are due. 
+            var runnableContexts = orderContexts;
+            if (!runLevel.HasFlag(RunLevel.NoCache) && !renewal.New && !renewal.Updated)
+            {
+                runnableContexts = orderContexts.Where(x => x.ShouldRun).ToList();
+            }
+            if (!runnableContexts.Any())
+            {
+                _log.Debug("None of the orders are currently due to run");
+                return Abort(renewal, result);
+            }
+
+            // Store results
+            result.OrderResults.AddRange(runnableContexts.Select(x => x.OrderResult));
+
+            if (!renewal.New && !runLevel.HasFlag(RunLevel.Force))
+            {
+                _log.Information(LogType.All, "Renewing {renewal}", renewal.LastFriendlyName);
+            }
+            if (orders.Count > runnableContexts.Count)
+            {
+                _log.Information("{n} of {m} orders are due to run", runnableContexts.Count, orders.Count);
+            }
+
+            // If at this point we haven't retured already with an error/abort
+            // actually execute the renewal
+
+            // Run the pre-execution script, e.g. to re-configure
+            // local firewall rules, since now it's (almost) sure
+            // that we're going to do something. Actually we may
+            // still be able to read all certificates from cache,
+            // but that's the exception rather than the rule.
+            var preScript = _settings.Execution?.DefaultPreExecutionScript;
+            var scriptClient = execute.Resolve<ScriptClient>();
+            if (!string.IsNullOrWhiteSpace(preScript))
+            {
+                await scriptClient.RunScript(preScript, $"{renewal.Id}");
+            }
+            await orderProcessor.ExecuteOrders(runnableContexts, runLevel);
+
+
+            // Handle all the store/install steps
+            await orderProcessor.ProcessOrders(runnableContexts, result);
+
+            // Run the post-execution script. Note that this is different
+            // from the script installation pluginService, which is handled
+            // in the previous step. This is only meant to undo any
+            // (firewall?) changes made by the pre-execution script.
+            var postScript = _settings.Execution?.DefaultPostExecutionScript;
+            if (!string.IsNullOrWhiteSpace(postScript))
+            {
+                await scriptClient.RunScript(postScript, $"{renewal.Id}");
+            }
+
+            // Handle missing order (clear cache)
+            orderProcessor.HandleMissing(renewal, missingOrders.Select(m => m.Key));
+
+            // Return final result
+            result.Success = runnableContexts.All(o => o.OrderResult.Success == true);
+            return result;
         }
     }
 }

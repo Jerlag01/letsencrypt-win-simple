@@ -2,29 +2,30 @@
 using Microsoft.Web.Administration;
 using Microsoft.Win32;
 using PKISharp.WACS.DomainObjects;
-using PKISharp.WACS.Plugins.StorePlugins;
 using PKISharp.WACS.Services;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.ServiceProcess;
 
 namespace PKISharp.WACS.Clients.IIS
 {
     internal class IISClient : IIISClient<IISSiteWrapper, IISBindingWrapper>, IDisposable
     {
+        public const string DefaultBindingPortFormat = "443"; 
         public const int DefaultBindingPort = 443;
         public const string DefaultBindingIp = "*";
 
         public Version Version { get; set; }
-        [SuppressMessage("Code Quality", "IDE0069:Disposable fields should be disposed", Justification = "Actually is disposed")]
-        private ServerManager? _ServerManager;
-        private readonly ILogService _log;
 
-        public IISClient(ILogService log)
+        private readonly ILogService _log;
+        private ServerManager? _serverManager;
+        private List<IISSiteWrapper>? _sites = null;
+
+        public IISClient(ILogService log, AdminService adminService)
         {
             _log = log;
-            Version = GetIISVersion();
+            Version = GetIISVersion(adminService);
         }
 
         /// <summary>
@@ -34,14 +35,22 @@ namespace PKISharp.WACS.Clients.IIS
         {
             get
             {
-                if (_ServerManager == null)
+                if (_serverManager == null)
                 {
                     if (Version.Major > 0)
                     {
-                        _ServerManager = new ServerManager();
+                        try
+                        {
+                            _serverManager = new ServerManager();
+                        } 
+                        catch
+                        {
+                            _log.Error($"Unable to create an IIS ServerManager");
+                        }
+                        _sites = null;
                     }
                 }
-                return _ServerManager;
+                return _serverManager;
             }
         }
 
@@ -53,11 +62,11 @@ namespace PKISharp.WACS.Clients.IIS
         /// </summary>
         private void Commit()
         {
-            if (_ServerManager != null)
+            if (_serverManager != null)
             {
                 try
                 {
-                    _ServerManager.CommitChanges();
+                    _serverManager.CommitChanges();
                 }
                 catch
                 {
@@ -73,19 +82,22 @@ namespace PKISharp.WACS.Clients.IIS
 
         public void Refresh()
         {
-            if (_ServerManager != null)
+            _sites = null;
+            if (_serverManager != null)
             {
-                _ServerManager.Dispose();
-                _ServerManager = null;
+                _serverManager.Dispose();
+                _serverManager = null;
             }
         }
 
         #region _ Basic retrieval _
 
-        public bool HasWebSites => Version.Major > 0 && WebSites.Any();
+        IEnumerable<IIISSite> IIISClient.Sites => Sites;
+        IIISSite IIISClient.GetSite(long id, IISSiteType? type) => GetSite(id, type);
+        public bool HasWebSites => Version.Major > 0 && Sites.Any(w => w.Type == IISSiteType.Web);
+        public bool HasFtpSites => Version >= new Version(7, 5) && Sites.Any(w => w.Type == IISSiteType.Ftp);
 
-        IEnumerable<IIISSite> IIISClient.WebSites => WebSites;
-        public IEnumerable<IISSiteWrapper> WebSites
+        public IEnumerable<IISSiteWrapper> Sites
         {
             get
             {
@@ -93,79 +105,58 @@ namespace PKISharp.WACS.Clients.IIS
                 {
                     return new List<IISSiteWrapper>();
                 }
-                return ServerManager.Sites.AsEnumerable().
-                    Where(s => s.Bindings.Any(sb => sb.Protocol == "http" || sb.Protocol == "https")).
-                    Where(s =>
-                    {
-                        try
-                        {
-                            return s.State == ObjectState.Started;
-                        }
-                        catch
-                        {
-                            // Prevent COMExceptions such as misconfigured
-                            // application pools from crashing the whole 
-                            _log.Warning("Unable to determine state for Site {id}", s.Id);
-                            return false;
-                        }
-                    }).
-                    OrderBy(s => s.Name).
-                    Select(x => new IISSiteWrapper(x));
+                _sites ??= ServerManager.Sites.AsEnumerable().
+                       Select(x => new IISSiteWrapper(x)).
+                       Where(s =>
+                       {
+                           switch (s.Type)
+                           {
+                               case IISSiteType.Ftp:
+                                   return true;
+                               case IISSiteType.Web:
+                                   try
+                                   {
+                                       return s.Site.State == ObjectState.Started;
+                                   }
+                                   catch
+                                   {
+                                       // Prevent COMExceptions such as misconfigured
+                                       // application pools from crashing the whole 
+                                       _log.Warning("Unable to determine state for Site {id}", s.Id);
+                                       return false;
+                                   }
+                               default:
+                                   return false;
+                           }
+                       }).
+                       OrderBy(s => s.Name).
+                       ToList();
+                return _sites;
             }
         }
 
-        IIISSite IIISClient.GetWebSite(long id) => GetWebSite(id);
-        public IISSiteWrapper GetWebSite(long id)
+        public IISSiteWrapper GetSite(long id, IISSiteType? type)
         {
-            foreach (var site in WebSites)
+            var ret = Sites.Where(s => s.Site.Id == id).FirstOrDefault();
+            if (ret == null)
             {
-                if (site.Site.Id == id)
-                {
-                    return site;
-                }
+                throw new Exception($"Unable to find IIS SiteId #{id}");
             }
-            throw new Exception($"Unable to find IIS SiteId #{id}");
-        }
-
-        public bool HasFtpSites => Version >= new Version(7, 5) && FtpSites.Any();
-
-        IEnumerable<IIISSite> IIISClient.FtpSites => FtpSites;
-        public IEnumerable<IISSiteWrapper> FtpSites
-        {
-            get
+            if (type != null && ret.Type != type)
             {
-                if (ServerManager == null)
-                {
-                    return new List<IISSiteWrapper>();
-                }
-                return ServerManager.Sites.AsEnumerable().
-                    Where(s => s.Bindings.Any(sb => sb.Protocol == "ftp")).
-                    OrderBy(s => s.Name).
-                    Select(x => new IISSiteWrapper(x));
+                throw new Exception($"IIS SiteId #{id} is not of the expected type {type}");
             }
-        }
-
-        IIISSite IIISClient.GetFtpSite(long id) => GetFtpSite(id);
-        public IISSiteWrapper GetFtpSite(long id)
-        {
-            foreach (var site in FtpSites)
-            {
-                if (site.Site.Id == id)
-                {
-                    return site;
-                }
-            }
-            throw new Exception($"Unable to find IIS SiteId #{id}");
+            return ret;
         }
 
         #endregion
 
         #region _ Https Install _
 
-        public void AddOrUpdateBindings(IEnumerable<string> identifiers, BindingOptions bindingOptions, byte[]? oldThumbprint)
+        public void UpdateHttpSite(IEnumerable<Identifier> identifiers, BindingOptions bindingOptions, byte[]? oldCertificate, IEnumerable<Identifier>? allIdentifiers)
         {
             var updater = new IISHttpBindingUpdater<IISSiteWrapper, IISBindingWrapper>(this, _log);
-            var updated = updater.AddOrUpdateBindings(identifiers, bindingOptions, oldThumbprint);
+            var updated = updater.AddOrUpdateBindings(identifiers, bindingOptions, allIdentifiers, oldCertificate);
             if (updated > 0)
             {
                 _log.Information("Committing {count} {type} binding changes to IIS", updated, "https");
@@ -173,22 +164,23 @@ namespace PKISharp.WACS.Clients.IIS
             }
             else
             {
-                _log.Warning("No bindings have been changed");
+                _log.Debug("No bindings have been changed");
             }
         }
 
-        public void AddBinding(IISSiteWrapper site, BindingOptions options)
+        public IIISBinding AddBinding(IISSiteWrapper site, BindingOptions options)
         {
             var newBinding = site.Site.Bindings.CreateElement("binding");
-            newBinding.Protocol = "https";
             newBinding.BindingInformation = options.Binding;
             newBinding.CertificateStoreName = options.Store;
-            newBinding.CertificateHash = options.Thumbprint;
+            newBinding.CertificateHash = options.Thumbprint?.ToArray();
+            newBinding.Protocol = "https";
             if (options.Flags > 0)
             {
                 newBinding.SetAttributeValue("sslFlags", options.Flags);
             }
             site.Site.Bindings.Add(newBinding);
+            return new IISBindingWrapper(newBinding, true);
         }
 
         public void UpdateBinding(IISSiteWrapper site, IISBindingWrapper existingBinding, BindingOptions options)
@@ -202,10 +194,10 @@ namespace PKISharp.WACS.Clients.IIS
                 "certificateHash"
             };
             var replacement = site.Site.Bindings.CreateElement("binding");
-            replacement.Protocol = existingBinding.Protocol;
             replacement.BindingInformation = existingBinding.BindingInformation;
             replacement.CertificateStoreName = options.Store;
-            replacement.CertificateHash = options.Thumbprint;
+            replacement.CertificateHash = options.Thumbprint?.ToArray();
+            replacement.Protocol = existingBinding.Protocol;
             foreach (var attr in existingBinding.Binding.Attributes)
             {
                 try
@@ -236,53 +228,103 @@ namespace PKISharp.WACS.Clients.IIS
         /// <summary>
         /// Update binding for FTPS site
         /// </summary>
-        /// <param name="FtpSiteId"></param>
+        /// <param name="id"></param>
         /// <param name="newCertificate"></param>
         /// <param name="oldCertificate"></param>
-        public void UpdateFtpSite(long FtpSiteId, CertificateInfo newCertificate, CertificateInfo? oldCertificate)
+        public void UpdateFtpSite(long? id, string? newStore, ICertificateInfo newCertificate, ICertificateInfo? oldCertificate)
         {
-            var ftpSites = FtpSites.ToList();
-            var oldThumbprint = oldCertificate?.Certificate?.Thumbprint;
-            var newThumbprint = newCertificate?.Certificate?.Thumbprint;
-            var newStore = newCertificate?.StoreInfo[typeof(CertificateStore)].Path;
+            var ftpSites = Sites.Where(x => x.Type == IISSiteType.Ftp).ToList();
+            var oldThumbprint = oldCertificate?.Thumbprint;
+            var newThumbprint = newCertificate?.Thumbprint;
             var updated = 0;
+
+            if (ServerManager == null)
+            {
+                return;
+            }
+
+            var sslElement = ServerManager.SiteDefaults.
+                GetChildElement("ftpServer").
+                GetChildElement("security").
+                GetChildElement("ssl");
+            if (RequireUpdate(sslElement, false, oldThumbprint, newThumbprint, newStore))
+            {
+                sslElement.SetAttributeValue("serverCertHash", newThumbprint);
+                sslElement.SetAttributeValue("serverCertStoreName", newStore);
+                _log.Information(LogType.All, "Updating default ftp site setting");
+                updated += 1;
+            } 
+            else
+            {
+                _log.Debug("No update needed for default ftp site settings");
+            }
+
             foreach (var ftpSite in ftpSites)
             {
-                var sslElement = ftpSite.Site.GetChildElement("ftpServer").
+                sslElement = ftpSite.Site.
+                    GetChildElement("ftpServer").
                     GetChildElement("security").
                     GetChildElement("ssl");
 
-                var currentThumbprint = sslElement.GetAttributeValue("serverCertHash").ToString();
-                var currentStore = sslElement.GetAttributeValue("serverCertStoreName").ToString();
-                var update = false;
-                if (ftpSite.Site.Id == FtpSiteId)
-                {
-                    update = 
-                        !string.Equals(currentThumbprint, newThumbprint, StringComparison.CurrentCultureIgnoreCase) ||
-                        !string.Equals(currentStore, newStore, StringComparison.CurrentCultureIgnoreCase);
-                    if (!update)
-                    {
-                        _log.Information(LogType.All, "No updated need for ftp site {name}", ftpSite.Site.Name);
-                    }
-                } 
-                else
-                {
-                    update = string.Equals(currentThumbprint, oldThumbprint, StringComparison.CurrentCultureIgnoreCase);
-                }
-
-                if (update)
+                if (RequireUpdate(sslElement, ftpSite.Id == id, oldThumbprint, newThumbprint, newStore))
                 {
                     sslElement.SetAttributeValue("serverCertHash", newThumbprint);
                     sslElement.SetAttributeValue("serverCertStoreName", newStore);
-                    _log.Information(LogType.All, "Updating existing ftp site {name}", ftpSite.Site.Name);
+                    _log.Information(LogType.All, "Updating ftp site {name}", ftpSite.Site.Name);
                     updated += 1;
                 }
+                else
+                {
+                    _log.Debug("No update needed for ftp site {name}", ftpSite.Site.Name);
+                }
             }
+
             if (updated > 0)
             {
                 _log.Information("Committing {count} {type} site changes to IIS", updated, "ftp");
                 Commit();
             }
+        }
+
+        /// <summary>
+        /// Test if FTP site needs a binding update
+        /// </summary>
+        /// <param name="element"></param>
+        /// <param name="installSite"></param>
+        /// <param name="oldThumbprint"></param>
+        /// <param name="newThumbprint"></param>
+        /// <param name="newStore"></param>
+        /// <returns></returns>
+        private static bool RequireUpdate(ConfigurationElement element, 
+            bool installSite, 
+            string? oldThumbprint, string? newThumbprint,
+            string? newStore)
+        {
+            if (string.Equals(oldThumbprint, newThumbprint, StringComparison.CurrentCultureIgnoreCase))
+            {
+                return false;
+            }
+            var currentThumbprint = element.GetAttributeValue("serverCertHash").ToString();
+            var currentStore = element.GetAttributeValue("serverCertStoreName").ToString();
+            bool update;
+            if (installSite)
+            {
+                // For the main installation target we want to replace
+                // any binding that doesn't match the exact thumbprint 
+                // and store of the new certificate
+                update =
+                    !string.Equals(currentThumbprint, newThumbprint, StringComparison.CurrentCultureIgnoreCase) ||
+                    !string.Equals(currentStore, newStore, StringComparison.CurrentCultureIgnoreCase);
+            }
+            else
+            {
+                // For all other sites, we only want to update bindings
+                // that contain the old thumbprint, e.g. which were 
+                // at some point manually linked to the certificate by the 
+                // admin.
+                update = string.Equals(currentThumbprint, oldThumbprint, StringComparison.CurrentCultureIgnoreCase);
+            }
+            return update;
         }
 
         #endregion
@@ -291,19 +333,87 @@ namespace PKISharp.WACS.Clients.IIS
         /// Determine IIS version based on registry
         /// </summary>
         /// <returns></returns>
-        private Version GetIISVersion()
+        private Version GetIISVersion(AdminService adminService)
         {
-            using var componentsKey = Registry.LocalMachine.OpenSubKey(@"Software\Microsoft\InetStp", false);
-            if (componentsKey != null)
+            // Get the W3SVC service
+            try
             {
-                var majorVersion = (int)componentsKey.GetValue("MajorVersion", -1);
-                var minorVersion = (int)componentsKey.GetValue("MinorVersion", -1);
-                if (majorVersion != -1 && minorVersion != -1)
+                var anyService = false;
+                var allServices = ServiceController.GetServices();
+                var w3Service = allServices.FirstOrDefault(s => string.Equals(s.ServiceName, "W3SVC", StringComparison.OrdinalIgnoreCase));
+                if (w3Service == null)
                 {
-                    return new Version(majorVersion, minorVersion);
+                    _log.Verbose("No W3SVC detected");
+                }
+                else if (w3Service.Status != ServiceControllerStatus.Running)
+                {
+                    _log.Verbose("W3SVC not running");
+                } 
+                else
+                {
+                    _log.Verbose("W3SVC detected and running");
+                    anyService = true;
+                }
+                var ftpService = allServices.FirstOrDefault(s => string.Equals(s.ServiceName, "FTPSVC", StringComparison.OrdinalIgnoreCase));
+                if (ftpService == null)
+                {
+                    _log.Verbose("No FTPSVC detected");
+                }
+                else if (ftpService.Status != ServiceControllerStatus.Running)
+                {
+                    _log.Verbose("FTPSVC not running");
+                }
+                else
+                {
+                    _log.Verbose("FTPSVC detected and running");
+                    anyService = true;
+                }
+                if (!anyService)
+                {
+                    return new Version(0, 0);
                 }
             }
-            return new Version(0, 0);
+            catch
+            {
+                _log.Warning("Unable to scan for services");
+            }
+            try
+            {
+                // Try to create a ServerManager object and read from it
+                if (adminService.IsAdmin)
+                {
+                    using var x = new ServerManager();
+                    _ = x.ApplicationDefaults;
+                }
+            }
+            catch (Exception ex)
+            {
+                // Assume no IIS if we're not able to use the server manager
+                _log.Verbose("IIS ServerManager exception: {message}", ex.Message);
+                return new Version(0, 0);
+            }
+
+            // Looks like IIS is working, now lets see if we can determine the version
+            try
+            {
+                using var componentsKey = Registry.LocalMachine.OpenSubKey(@"Software\Microsoft\InetStp", false);
+                if (componentsKey != null)
+                {
+                    _ = int.TryParse(componentsKey.GetValue("MajorVersion", "-1")?.ToString() ?? "-1", out var majorVersion);
+                    _ = int.TryParse(componentsKey.GetValue("MinorVersion", "-1")?.ToString() ?? "-1", out var minorVersion);
+                    if (majorVersion != -1 && minorVersion != -1)
+                    {
+                        return new Version(majorVersion, minorVersion);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Verbose("Error reading IIS version fomr registry: {message}", ex.Message);
+            }
+            _log.Verbose("Unable to detect IIS version, making assumption");
+            return new Version(10, 0);
+
         }
 
         #region IDisposable
@@ -316,10 +426,7 @@ namespace PKISharp.WACS.Clients.IIS
             {
                 if (disposing)
                 {
-                    if (_ServerManager != null)
-                    {
-                        _ServerManager.Dispose();
-                    }
+                    _serverManager?.Dispose();
                 }
                 disposedValue = true;
             }

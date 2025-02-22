@@ -1,62 +1,120 @@
-﻿using Microsoft.Extensions.Configuration;
+﻿using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
+using PKISharp.WACS.Configuration.Settings;
 using PKISharp.WACS.Extensions;
 using System;
-using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Text.Json;
 
 namespace PKISharp.WACS.Services
 {
     public class SettingsService : ISettingsService
     {
         private readonly ILogService _log;
-        private readonly IArgumentsService _arguments;
-
+        private readonly Settings _settings;
+        private readonly MainArguments? _arguments;
         public bool Valid { get; private set; } = false;
-        public ClientSettings Client { get; private set; } = new ClientSettings();
-        public UiSettings UI { get; private set; } = new UiSettings();
-        public AcmeSettings Acme { get; private set; } = new AcmeSettings();
-        public ProxySettings Proxy { get; private set; } = new ProxySettings();
-        public CacheSettings Cache { get; private set; } = new CacheSettings();
-        public ScheduledTaskSettings ScheduledTask { get; private set; } = new ScheduledTaskSettings();
-        public NotificationSettings Notification { get; private set; } = new NotificationSettings();
-        public SecuritySettings Security { get; private set; } = new SecuritySettings();
-        public ScriptSettings Script { get; private set; } = new ScriptSettings();
-        public ValidationSettings Validation { get; private set; } = new ValidationSettings();
-        public StoreSettings Store { get; private set; } = new StoreSettings();
-        public string ExePath { get; private set; } = Process.GetCurrentProcess().MainModule.FileName;
 
-        public SettingsService(ILogService log, IArgumentsService arguments)
+        public SettingsService(ILogService log, ArgumentsParser parser)
         {
             _log = log;
-            _arguments = arguments;
-
-            var installDir = new FileInfo(ExePath).DirectoryName;
-            _log.Verbose($"Looking for settings.json in {installDir}");
-            var settings = new FileInfo(Path.Combine(installDir, "settings.json"));
-            var settingsTemplate = new FileInfo(Path.Combine(installDir, "settings_default.json"));
-            if (!settings.Exists && settingsTemplate.Exists)
+            _settings = new Settings();
+            var settingsFileName = "settings.json";
+            var settingsFileTemplateName = "settings_default.json";
+            _log.Verbose("Looking for {settingsFileName} in {path}", settingsFileName, VersionService.SettingsPath);
+            var settings = new FileInfo(Path.Combine(VersionService.SettingsPath, settingsFileName));
+            var settingsTemplate = new FileInfo(Path.Combine(VersionService.ResourcePath, settingsFileTemplateName));
+            var useFile = settings;
+            if (!settings.Exists)
             {
-                _log.Verbose($"Copying settings_default.json to settings.json");
-                settingsTemplate.CopyTo(settings.FullName);
+                if (!settingsTemplate.Exists)
+                {
+                    // For .NET tool case
+                    settingsTemplate = new FileInfo(Path.Combine(VersionService.ResourcePath, settingsFileName));
+                }
+                if (!settingsTemplate.Exists)
+                {
+                    _log.Warning("Unable to locate {settings}", settingsFileName);
+                } 
+                else
+                {
+                    _log.Verbose("Copying {settingsFileTemplateName} to {settingsFileName}", settingsFileTemplateName, settingsFileName);
+                    try
+                    {
+                        if (!settings.Directory!.Exists)
+                        {
+                            settings.Directory.Create();
+                        }
+                        settingsTemplate.CopyTo(settings.FullName);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.Error(ex, "Unable to create {settingsFileName}, falling back to defaults", settingsFileName);
+                        useFile = settingsTemplate;
+                    }
+                }
             }
 
             try
             {
-                new ConfigurationBuilder()
-                    .AddJsonFile(Path.Combine(installDir, "settings.json"), true, true)
-                    .Build()
-                    .Bind(this);
+                using var fs = useFile.OpenRead();
+                var newSettings = JsonSerializer.Deserialize(fs, SettingsJson.Insensitive.Settings);
+                if (newSettings != null)
+                {
+                    _settings = newSettings;
+                }
+
+                // This code specifically deals with backwards compatibility 
+                // so it is allowed to use obsolete properties
+#pragma warning disable CS0618
+                static string? Fallback(string? x, string? y) => x ?? y;
+                Source.DefaultSource = Fallback(Source.DefaultSource, Target.DefaultTarget);
+                Store.PemFiles.DefaultPath = Fallback(Store.PemFiles.DefaultPath, Store.DefaultPemFilesPath);
+                Store.CentralSsl.DefaultPath = Fallback(Store.CentralSsl.DefaultPath, Store.DefaultCentralSslStore);
+                Store.CentralSsl.DefaultPassword = Fallback(Store.CentralSsl.DefaultPassword, Store.DefaultCentralSslPfxPassword);
+                Store.CertificateStore.DefaultStore = Fallback(Store.CertificateStore.DefaultStore, Store.DefaultCertificateStore);
+#pragma warning restore CS0618
             }
             catch (Exception ex)
             {
-                _log.Error(new Exception("Invalid settings.json", ex), "Unable to start program");
+                _log.Error($"Unable to start program using {useFile.Name}");
+                while (ex.InnerException != null)
+                {
+                    _log.Error(ex.InnerException.Message);
+                    ex = ex.InnerException;
+                }
                 return;
             }
 
-            CreateConfigPath();
-            CreateLogPath();
-            CreateCachePath();
+            // Validate command line and ensure main arguments
+            // are loaded, because those influence the BaseUri
+            if (!parser.Validate())
+            {
+                return;
+            }
+            _arguments = parser.GetArguments<MainArguments>();
+            if (_arguments == null)
+            {
+                return;
+            }
+
+            var configRoot = ChooseConfigPath();
+            Client.ConfigurationPath = Path.Combine(configRoot, BaseUri.CleanUri());
+            Client.LogPath = ChooseLogPath();
+            Cache.Path = ChooseCachePath();
+
+            EnsureFolderExists(configRoot, "configuration", true);
+            EnsureFolderExists(Client.ConfigurationPath, "configuration", false);
+            EnsureFolderExists(Client.LogPath, "log", !Client.LogPath.StartsWith(Client.ConfigurationPath));
+            EnsureFolderExists(Cache.Path, "cache", !Client.LogPath.StartsWith(Client.ConfigurationPath));
+
+            // Configure disk logger
+            _log.SetDiskLoggingPath(Client.LogPath);
+
+
+
             Valid = true;
         }
 
@@ -64,19 +122,11 @@ namespace PKISharp.WACS.Services
         {
             get
             {
-                Uri? ret;
-                if (!string.IsNullOrEmpty(_arguments.MainArguments.BaseUri))
-                {
-                    ret = new Uri(_arguments.MainArguments.BaseUri);
-                }
-                else if (_arguments.MainArguments.Test)
-                {
-                    ret = Acme.DefaultBaseUriTest;
-                }
-                else
-                {
-                    ret = Acme.DefaultBaseUri;
-                }
+                var ret = !string.IsNullOrEmpty(_arguments?.BaseUri)
+                    ? new Uri(_arguments.BaseUri)
+                    : _arguments?.Test ?? false ?
+                        Acme.DefaultBaseUriTest :
+                        Acme.DefaultBaseUri;
                 if (ret == null)
                 {
                     throw new Exception("Unable to determine BaseUri");
@@ -86,14 +136,12 @@ namespace PKISharp.WACS.Services
         }
 
         /// <summary>
-        /// Find and/or create path of the configuration files
+        /// Determine which folder to use for configuration data
         /// </summary>
-        /// <param name="arguments"></param>
-        private void CreateConfigPath()
+        private string ChooseConfigPath()
         {
-            var configRoot = "";
-
             var userRoot = Client.ConfigurationPath;
+            string? configRoot;
             if (!string.IsNullOrEmpty(userRoot))
             {
                 configRoot = userRoot;
@@ -110,391 +158,179 @@ namespace PKISharp.WACS.Services
             }
             else
             {
-                // When using a system folder, we have to create a sub folder
-                // with the most preferred client name, but we should check first
-                // if there is an older folder with an less preferred (older)
-                // client name.
-
-                // Stop looking if the directory has been found
-                if (!Directory.Exists(configRoot))
-                {
-                    var appData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-                    configRoot = Path.Combine(appData, Client.ClientName);
-                }
+                var appData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+                configRoot = Path.Combine(appData, Client.ClientName);
             }
+            return configRoot;
+        }
 
-            // This only happens when invalid options are provided 
-            Client.ConfigurationPath = Path.Combine(configRoot, BaseUri.CleanUri());
+        /// <summary>
+        /// Determine which folder to use for logging
+        /// </summary>
+        private string ChooseLogPath()
+        {
+            if (string.IsNullOrWhiteSpace(Client.LogPath))
+            {
+                return Path.Combine(Client.ConfigurationPath, "Log");
+            }
+            else
+            {
+                // Create separate logs for each endpoint
+                return Path.Combine(Client.LogPath, BaseUri.CleanUri());
+            }
+        }
 
-            // Create folder if it doesn't exist yet
-            var di = new DirectoryInfo(Client.ConfigurationPath);
+        /// <summary>
+        /// Determine which folder to use for cache certificates
+        /// </summary>
+        private string ChooseCachePath()
+        {
+            if (string.IsNullOrWhiteSpace(Cache.Path))
+            {
+                return Path.Combine(Client.ConfigurationPath, "Certificates");
+            }
+            return Cache.Path;
+        }
+
+        /// <summary>
+        /// Create folder if needed
+        /// </summary>
+        /// <param name="path"></param>
+        /// <param name="label"></param>
+        /// <exception cref="Exception"></exception>
+        private void EnsureFolderExists(string path, string label, bool checkAcl)
+        {
+            var created = false;
+            var di = new DirectoryInfo(path);
             if (!di.Exists)
             {
                 try
                 {
-                    Directory.CreateDirectory(Client.ConfigurationPath);
-                } 
-                catch (Exception ex)
-                {
-                    throw new Exception($"Unable to create configuration path {Client.ConfigurationPath}", ex);
-                }
-            }
-
-            _log.Debug("Config folder: {_configPath}", Client.ConfigurationPath);
-        }
-
-        /// <summary>
-        /// Find and/or created path of the certificate cache
-        /// </summary>
-        private void CreateLogPath()
-        {
-            if (string.IsNullOrWhiteSpace(Client.LogPath))
-            {
-                Client.LogPath = Path.Combine(Client.ConfigurationPath, "Log");
-            }
-            if (!Directory.Exists(Client.LogPath))
-            {
-                try
-                {
-                    Directory.CreateDirectory(Client.LogPath);
+                    di = Directory.CreateDirectory(path);
+                    _log.Debug($"Created {label} folder {{path}}", path);
+                    created = true;
                 }
                 catch (Exception ex)
                 {
-                    _log.Error(ex, "Unable to create log directory {_logPath}", Client.LogPath);
-                    throw;
+                    throw new Exception($"Unable to create {label} {path}", ex);
                 }
             }
-            _log.Debug("Log path: {_logPath}", Client.LogPath);
+            else
+            {
+                _log.Debug($"Use existing {label} folder {{path}}", path);
+            }
+            if (checkAcl)
+            {
+                EnsureFolderAcl(di, label, created);
+            }
         }
 
         /// <summary>
-        /// Find and/or created path of the certificate cache
+        /// Ensure proper access rights to a folder
         /// </summary>
-        private void CreateCachePath()
+        private void EnsureFolderAcl(DirectoryInfo di, string label, bool created)
         {
-            if (string.IsNullOrWhiteSpace(Cache.Path))
+            // Test access control rules
+            var (access, inherited) = UsersHaveAccess(di);
+            if (!access)
             {
-                Cache.Path = Path.Combine(Client.ConfigurationPath, "Certificates");
+                return;
             }
-            if (!Directory.Exists(Cache.Path))
+
+            if (!created)
             {
-                try
-                {
-                    Directory.CreateDirectory(Cache.Path);
-                }
-                catch (Exception ex)
-                {
-                    _log.Error(ex, "Unable to create cache path {_certificatePath}", Cache.Path);
-                    throw;
-                }
+                _log.Warning("All users currently have access to {path}.", di.FullName);
+                _log.Warning("We will now try to limit access to improve security...", label, di.FullName);
             }
-            _log.Debug("Cache path: {_certificatePath}", Cache.Path);
-        }
+            try
+            {
+                var acl = di.GetAccessControl();
+                if (inherited)
+                {
+                    // Disable access rule inheritance
+                    acl.SetAccessRuleProtection(true, true);
+                    di.SetAccessControl(acl);
+                    acl = di.GetAccessControl();
+                }
 
-        public class ClientSettings
-        {
-            public string ClientName { get; set; } = "win-acme";
-            public string ConfigurationPath { get; set; } = "";
-            public string? LogPath { get; set; }
-        }
-
-        public class UiSettings
-        {
-            /// <summary>
-            /// The number of hosts to display per page.
-            /// </summary>
-            public int PageSize { get; set; }
-            /// <summary>
-            /// A string that is used to format the date of the 
-            /// pfx file friendly name. Documentation for 
-            /// possibilities is available from Microsoft.
-            /// </summary>
-            public string? DateFormat { get; set; }
-            /// <summary>
-            /// How console tekst should be encoded
-            /// </summary>
-            public string? TextEncoding { get; set; }
-        }
-
-        public class AcmeSettings
-        {
-            /// <summary>
-            /// Default ACMEv2 endpoint to use when none 
-            /// is specified with the command line.
-            /// </summary>
-            public Uri? DefaultBaseUri { get; set; }
-            /// <summary>
-            /// Default ACMEv2 endpoint to use when none is specified 
-            /// with the command line and the --test switch is
-            /// activated.
-            /// </summary>
-            public Uri? DefaultBaseUriTest { get; set; }
-            /// <summary>
-            /// Default ACMEv1 endpoint to import renewal settings from.
-            /// </summary>
-            public Uri? DefaultBaseUriImport { get; set; }
-            /// <summary>
-            /// Use POST-as-GET request mode
-            /// </summary>
-            public bool PostAsGet { get; set; }
-            /// <summary>
-            /// Number of times wait for the ACME server to 
-            /// handle validation and order processing
-            /// </summary>
-            public int RetryCount { get; set; } = 4;
-            /// <summary>
-            /// Amount of time (in seconds) to wait each 
-            /// retry for the validation handling and order
-            /// processing
-            /// </summary>
-            public int RetryInterval { get; set; } = 2;
-        }
-
-        public class ProxySettings
-        {
-            /// <summary>
-            /// Configures a proxy server to use for 
-            /// communication with the ACME server. The 
-            /// default setting uses the system proxy.
-            /// Passing an empty string will bypass the 
-            /// system proxy.
-            /// </summary>
-            public string? Url { get; set; }
-            /// <summary>
-            /// Username used to access the proxy server.
-            /// </summary>
-            public string? Username { get; set; }
-            /// <summary>
-            /// Password used to access the proxy server.
-            /// </summary>
-            public string? Password { get; set; }
-        }
-
-        public class CacheSettings
-        {
-            /// <summary>
-            /// The path where certificates and request files are 
-            /// stored. If not specified or invalid, this defaults 
-            /// to (ConfigurationPath)\Certificates. All directories
-            /// and subdirectories in the specified path are created 
-            /// unless they already exist. If you are using a 
-            /// [[Central SSL Store|Store-Plugins#centralssl]], this
-            /// can not be set to the same path.
-            /// </summary>
-            public string? Path { get; set; }
-            /// <summary>
-            /// When renewing or re-creating a previously
-            /// requested certificate that has the exact 
-            /// same set of domain names, the program will 
-            /// used a cached version for this many days,
-            /// to prevent users from running into rate 
-            /// limits while experimenting. Set this to 
-            /// a high value if you regularly re-request 
-            /// the same certificates, e.g. for a Continuous 
-            /// Deployment scenario.
-            /// </summary>
-            public int ReuseDays { get; set; }
-            /// <summary>
-            /// Automatically delete files older than 120 days 
-            /// from the CertificatePath folder. Running with 
-            /// default settings, these should only be long-
-            /// expired certificates, generated for abandoned
-            /// renewals. However we do advise caution.
-            /// </summary>
-            public bool DeleteStaleFiles { get; set; }
-
-        }
-
-        public class ScheduledTaskSettings
-        {
-            /// <summary>
-            /// The number of days to renew a certificate 
-            /// after. Let’s Encrypt certificates are 
-            /// currently for a max of 90 days so it is 
-            /// advised to not increase the days much.
-            /// If you increase the days, please note
-            /// that you will have less time to fix any
-            /// issues if the certificate doesn’t renew 
-            /// correctly.
-            /// </summary>
-            public int RenewalDays { get; set; }
-            /// <summary>
-            /// Configures random time to wait for starting 
-            /// the scheduled task.
-            /// </summary>
-            public TimeSpan RandomDelay { get; set; }
-            /// <summary>
-            /// Configures start time for the scheduled task.
-            /// </summary>
-            public TimeSpan StartBoundary { get; set; }
-            /// <summary>
-            /// Configures time after which the scheduled 
-            /// task will be terminated if it hangs for
-            /// whatever reason.
-            /// </summary>
-            public TimeSpan ExecutionTimeLimit { get; set; }
-        }
-
-        public class NotificationSettings
-        {
-            /// <summary>
-            /// SMTP server to use for sending email notifications. 
-            /// Required to receive renewal failure notifications.
-            /// </summary>
-            public string? SmtpServer { get; set; }
-            /// <summary>
-            /// SMTP server port number.
-            /// </summary>
-            public int SmtpPort { get; set; }
-            /// <summary>
-            /// User name for the SMTP server, in case 
-            /// of authenticated SMTP.
-            /// </summary>
-            public string? SmtpUser { get; set; }
-            /// <summary>
-            /// Password for the SMTP server, in case 
-            /// of authenticated SMTP.
-            /// </summary>
-            public string? SmtpPassword { get; set; }
-            /// <summary>
-            /// Change to True to enable SMTPS.
-            /// </summary>
-            public bool SmtpSecure { get; set; }
-            /// <summary>
-            /// Display name to use as the sender of 
-            /// notification emails. Defaults to the 
-            /// ClientName setting when empty.
-            /// </summary>
-            public string? SenderName { get; set; }
-            /// <summary>
-            /// Email address to use as the sender 
-            /// of notification emails. Required to 
-            /// receive renewal failure notifications.
-            /// </summary>
-            public string? SenderAddress { get; set; }
-            /// <summary>
-            /// Email addresses to receive notification emails. 
-            /// Required to receive renewal failure 
-            /// notifications.
-            /// </summary>
-            public List<string>? ReceiverAddresses { get; set; }
-            /// <summary>
-            /// Send an email notification when a certificate 
-            /// has been successfully renewed, as opposed to 
-            /// the default behavior that only send failure
-            /// notifications. Only works if at least 
-            /// SmtpServer, SmtpSenderAddressand 
-            /// SmtpReceiverAddress have been configured.
-            /// </summary>
-            public bool EmailOnSuccess { get; set; }
-        }
-
-        public class SecuritySettings
-        {
-            /// <summary>
-            /// The key size to sign the certificate with. 
-            /// Minimum is 2048.
-            /// </summary>
-            public int RSAKeyBits { get; set; }
-            /// <summary>
-            /// The curve to use for EC certificates.
-            /// </summary>
-            public string? ECCurve { get; set; }
-            /// <summary>
-            /// If set to True, it will be possible to export 
-            /// the generated certificates from the certificate 
-            /// store, for example to move them to another 
-            /// server.
-            /// </summary>
-            public bool PrivateKeyExportable { get; set; }
-            /// <summary>
-            /// Uses Microsoft Data Protection API to encrypt 
-            /// sensitive parts of the configuration, e.g. 
-            /// passwords. This may be disabled to share 
-            /// the configuration across a cluster of machines.
-            /// </summary>
-            public bool EncryptConfig { get; set; }
+                var sid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+                var rules = acl.GetAccessRules(true, true, typeof(SecurityIdentifier));
+                foreach (FileSystemAccessRule rule in rules)
+                {
+                    if (rule.IdentityReference == sid &&
+                        rule.AccessControlType == AccessControlType.Allow)
+                    {
+                        acl.RemoveAccessRule(rule);
+                    }
+                }
+                var user = WindowsIdentity.GetCurrent().User;
+                if (user != null)
+                {
+                    // Allow user access from non-privilegdes perspective 
+                    // as well.
+                    acl.AddAccessRule(
+                        new FileSystemAccessRule(
+                            user,
+                            FileSystemRights.Read | FileSystemRights.Delete | FileSystemRights.Modify,
+                            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                            PropagationFlags.None,
+                            AccessControlType.Allow));
+                }
+                di.SetAccessControl(acl);
+                _log.Warning($"...done. You may manually add specific trusted accounts to the ACL.");
+            } 
+            catch (Exception ex)
+            {
+                _log.Error(ex, $"...failed, please take this step manually.");
+            }
         }
 
         /// <summary>
-        /// Options for installation and DNS scripts
+        /// Test if users have access through inherited or direct rules
         /// </summary>
-        public class ScriptSettings
+        /// <param name="di"></param>
+        /// <returns></returns>
+        private static (bool, bool) UsersHaveAccess(DirectoryInfo di)
         {
-            public int Timeout { get; set; } = 600;
+            var acl = di.GetAccessControl();
+            var sid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
+            var rules = acl.GetAccessRules(true, true, typeof(SecurityIdentifier));
+            var hit = false;
+            var inherited = false;
+            foreach (FileSystemAccessRule rule in rules)
+            {
+                if (rule.IdentityReference == sid &&
+                    rule.AccessControlType == AccessControlType.Allow)
+                {
+                    hit = true;
+                    inherited = inherited || rule.IsInherited;
+                }
+            }
+            return (hit, inherited);
         }
 
-        public class ValidationSettings
-        {
-            /// <summary>
-            /// If set to True, it will cleanup the folder structure
-            /// and files it creates under the site for authorization.
-            /// </summary>
-            public bool CleanupFolders { get; set; }
-            /// <summary>
-            /// If set to `true`, it will wait until it can verify that the 
-            /// validation record has been created and is available before 
-            /// beginning DNS validation.
-            /// </summary>
-            public bool PreValidateDns { get; set; } = true;
-            /// <summary>
-            /// Maximum numbers of times to retry DNS pre-validation, while
-            /// waiting for the name servers to start providing the expected
-            /// answer.
-            /// </summary>
-            public int PreValidateDnsRetryCount { get; set; } = 5;
-            /// <summary>
-            /// Amount of time in seconds to wait between each retry.
-            /// </summary>
-            public int PreValidateDnsRetryInterval { get; set; } = 30;
-            /// <summary>
-            /// A comma seperated list of servers to query during DNS 
-            /// prevalidation checks to verify whether or not the validation 
-            /// record has been properly created and is visible for the world.
-            /// These servers will be used to located the actual authoritative 
-            /// name servers for the domain. You can use the string [System] to
-            /// have the program query your servers default, but note that this 
-            /// can lead to prevalidation failures when your Active Directory is 
-            /// hosting a private version of the DNS zone for internal use.
-            /// </summary>
-            public List<string>? DnsServers { get; set; }
-        }
+        /// <summary>
+        /// Interface implementation
+        /// </summary>
 
-        public class StoreSettings
-        {
-            /// <summary>
-            /// The certificate store to save the certificates in. If left empty, 
-            /// certificates will be installed either in the WebHosting store, 
-            /// or if that is not available, the My store (better known as Personal).
-            /// </summary>
-            public string? DefaultCertificateStore { get; set; }
-            /// <summary>
-            /// When using --store centralssl this path is used by default, saving you
-            /// the effort from providing it manually. Filling this out makes the 
-            /// --centralsslstore parameter unnecessary in most cases. Renewals 
-            /// created with the default path will automatically change to any 
-            /// future default value, meaning this is also a good practice for 
-            /// maintainability.
-            /// </summary>
-            public string? DefaultCentralSslStore { get; set; }
-            /// <summary>
-            /// When using --store centralssl this password is used by default for 
-            /// the pfx files, saving you the effort from providing it manually. 
-            /// Filling this out makes the --pfxpassword parameter unnecessary in 
-            /// most cases. Renewals created with the default password will 
-            /// automatically change to any future default value, meaning this
-            /// is also a good practice for maintainability.
-            /// </summary>
-            public string? DefaultCentralSslPfxPassword { get; set; }
-            /// <summary>
-            /// When using --store pemfiles this path is used by default, saving 
-            /// you the effort from providing it manually. Filling this out makes 
-            /// the --pemfilespath parameter unnecessary in most cases. Renewals 
-            /// created with the default path will automatically change to any 
-            /// future default value, meaning this is also a good practice for 
-            /// maintainability.
-            /// </summary>
-            public string? DefaultPemFilesPath { get; set; }
-        }
+        public UiSettings UI => _settings.UI;
+        public AcmeSettings Acme => _settings.Acme;
+        public ExecutionSettings Execution => _settings.Execution;
+        public ProxySettings Proxy => _settings.Proxy;
+        public CacheSettings Cache => _settings.Cache;
+        public SecretsSettings Secrets => _settings.Secrets;
+        public ScheduledTaskSettings ScheduledTask => _settings.ScheduledTask;
+        public NotificationSettings Notification => _settings.Notification;
+        public SecuritySettings Security => _settings.Security;
+        public ScriptSettings Script => _settings.Script;
+        public ClientSettings Client => _settings.Client;
+        public SourceSettings Source => _settings.Source;
+        [Obsolete("Use Source instead")]
+        public SourceSettings Target => _settings.Target;
+        public ValidationSettings Validation => _settings.Validation;
+        public OrderSettings Order => _settings.Order;
+        public CsrSettings Csr => _settings.Csr;
+        public StoreSettings Store => _settings.Store;
+        public InstallationSettings Installation => _settings.Installation;
     }
 }

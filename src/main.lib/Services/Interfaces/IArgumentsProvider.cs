@@ -1,11 +1,11 @@
-﻿using Fclp;
-using Fclp.Internals;
-using PKISharp.WACS.Configuration;
+﻿using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 
 namespace PKISharp.WACS.Services
 {
-    public interface IArgumentsProvider
+    public interface IArgumentsGroup
     {
         /// <summary>
         /// Name for this group of options
@@ -13,7 +13,7 @@ namespace PKISharp.WACS.Services
         string Name { get; }
 
         /// <summary>
-        /// Group (e.g. Target, Validation, Store)
+        /// Group (e.g. MainTarget, Validation, Store)
         /// </summary>
         string Group { get; }
 
@@ -26,21 +26,39 @@ namespace PKISharp.WACS.Services
         /// Precondition to use these parameters
         /// </summary>
         bool Default { get; }
+    }
+
+    public interface IArguments : IArgumentsGroup
+    {
+        /// <summary>
+        /// Are the arguments provided?
+        /// </summary>
+        /// <param name="current"></param>
+        /// <returns></returns>
+        bool Active(string[] args);
+    }
+
+    public interface IArgumentsProvider : IArgumentsGroup
+    {
+        /// <summary>
+        /// Reference to the logging service
+        /// </summary>
+        ILogService? Log { get; set; }
 
         /// <summary>
         /// Which options are available
         /// </summary>
-        IEnumerable<ICommandLineOption> Configuration { get; }
+        IEnumerable<CommandLineAttribute> Configuration { get; }
 
         /// <summary>
         /// Feedback about the parsing
         /// </summary>
-        ICommandLineParserResult GetParseResult(string[] args);
+        IEnumerable<string> GetExtraArguments(string[] args);
 
         /// <summary>
         /// Get the parsed result
         /// </summary>
-        object GetResult(string[] args);
+        object? GetResult(string[] args);
 
         /// <summary>
         /// Validate against the main arguments
@@ -48,22 +66,22 @@ namespace PKISharp.WACS.Services
         /// <param name="current"></param>
         /// <param name="main"></param>
         /// <returns></returns>
-        bool Validate(ILogService log, object current, MainArguments main);
+        bool Validate(object current, MainArguments main, string[] args);
 
         /// <summary>
         /// Are the arguments provided?
         /// </summary>
         /// <param name="current"></param>
         /// <returns></returns>
-        bool Active(object current);
+        bool Active(object current, string[] args);
     }
 
-    public interface IArgumentsProvider<T> : IArgumentsProvider where T : new()
+    public interface IArgumentsProvider<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] T> : IArgumentsProvider where T : class, new()
     {
         /// <summary>
         /// Get the parsed result
         /// </summary>
-        new T GetResult(string[] args);
+        new T? GetResult(string[] args);
 
         /// <summary>
         /// Validate against the main arguments
@@ -71,6 +89,6 @@ namespace PKISharp.WACS.Services
         /// <param name="current"></param>
         /// <param name="main"></param>
         /// <returns></returns>
-        bool Validate(ILogService log, T current, MainArguments main);
+        bool Validate(T current, MainArguments main, string[] args);
     }
 }

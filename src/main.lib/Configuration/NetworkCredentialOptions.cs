@@ -1,7 +1,11 @@
-﻿using Newtonsoft.Json;
+﻿using PKISharp.WACS.Configuration.Arguments;
+using PKISharp.WACS.Extensions;
 using PKISharp.WACS.Services;
 using PKISharp.WACS.Services.Serialization;
+using System.Collections.Generic;
 using System.Net;
+using System.Text.Json.Serialization;
+using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Configuration
 {
@@ -9,37 +13,48 @@ namespace PKISharp.WACS.Configuration
     {
         public string? UserName { get; set; }
 
-        [JsonProperty(propertyName: "PasswordSafe")]
+        [JsonPropertyName("PasswordSafe")]
         public ProtectedString? Password { get; set; }
 
-        public NetworkCredential GetCredential() => new NetworkCredential(UserName, Password?.Value);
+        public NetworkCredential GetCredential(
+            SecretServiceManager secretService) =>
+            new(UserName, secretService.EvaluateSecret(Password?.Value));
 
         public void Show(IInputService input)
         {
             input.Show("Username", UserName);
-            input.Show("Password", new string('*', Password?.Value?.Length ?? 0));
+            input.Show("Password", Password?.DisplayValue);
         }
 
         public NetworkCredentialOptions() { }
 
-        public NetworkCredentialOptions(string? userName, string? password)
+        public NetworkCredentialOptions(string? userName, string? password) : this(userName, password.Protect()) { }
+        public NetworkCredentialOptions(string? userName, ProtectedString? password)
         {
             UserName = userName;
-            Password = new ProtectedString(password);
+            Password = password;
         }
 
-        public NetworkCredentialOptions(IArgumentsService arguments)
+        public static async Task<NetworkCredentialOptions> Create(ArgumentsInputService arguments)
         {
-            var args = arguments.GetArguments<NetworkCredentialArguments>();
-            UserName = arguments.TryGetRequiredArgument(nameof(args.UserName), args.UserName);
-            Password = new ProtectedString(arguments.TryGetRequiredArgument(nameof(args.Password), args.Password));
+            return new NetworkCredentialOptions(
+                await arguments.GetString<NetworkCredentialArguments>(x => x.UserName).GetValue(),
+                await arguments.GetProtectedString<NetworkCredentialArguments>(x => x.Password).GetValue()
+            );
         }
 
-        public NetworkCredentialOptions(IArgumentsService arguments, IInputService input)
+        public static async Task<NetworkCredentialOptions> Create(ArgumentsInputService arguments, IInputService input, string purpose)
         {
-            var args = arguments.GetArguments<NetworkCredentialArguments>();
-            UserName = arguments.TryGetArgument(args.UserName, input, "Username").Result;
-            Password = new ProtectedString(arguments.TryGetArgument(args.Password, input, "Password", true).Result);
+            return new NetworkCredentialOptions(
+                await arguments.GetString<NetworkCredentialArguments>(x => x.UserName).Interactive(input, purpose + " username").GetValue(),
+                await arguments.GetProtectedString<NetworkCredentialArguments>(x => x.Password).Interactive(input, purpose + "password").GetValue()
+            );
+        }
+
+        public IEnumerable<(CommandLineAttribute, object?)> Describe(ArgumentsInputService arguments)
+        {
+            yield return (arguments.GetString<NetworkCredentialArguments>(x => x.UserName).Meta, UserName);
+            yield return (arguments.GetString<NetworkCredentialArguments>(x => x.Password).Meta, Password);
         }
     }
 }

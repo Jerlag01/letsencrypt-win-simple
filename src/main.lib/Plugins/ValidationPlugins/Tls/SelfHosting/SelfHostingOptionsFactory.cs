@@ -1,34 +1,36 @@
-﻿using PKISharp.WACS.DomainObjects;
+﻿using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
 using PKISharp.WACS.Plugins.Base.Factories;
 using PKISharp.WACS.Services;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Plugins.ValidationPlugins.Tls
 {
-    internal class SelfHostingOptionsFactory : ValidationPluginOptionsFactory<SelfHosting, SelfHostingOptions>
+    internal class SelfHostingOptionsFactory : PluginOptionsFactory<SelfHostingOptions>
     {
-        private readonly IArgumentsService _arguments;
-        private readonly UserRoleService _userRoleService;
+        private readonly ArgumentsInputService _arguments;
 
-        public SelfHostingOptionsFactory(IArgumentsService arguments, UserRoleService userRoleService) : base(Constants.TlsAlpn01ChallengeType)
-        {
-            _arguments = arguments;
-            _userRoleService = userRoleService;
-        }
+        private ArgumentResult<int?> HostingPort => 
+            _arguments.GetInt<SelfHostingArguments>(x => x.ValidationPort);
+
+        public SelfHostingOptionsFactory(ArgumentsInputService arguments)
+            => _arguments = arguments;
 
         public override int Order => 100;
 
-        public override bool Disabled => SelfHosting.IsDisabled(_userRoleService);
-
-        public override Task<SelfHostingOptions?> Aquire(Target target, IInputService inputService, RunLevel runLevel) => Default(target);
-
-        public override async Task<SelfHostingOptions?> Default(Target target)
+        public override async Task<SelfHostingOptions?> Default()
         {
-            var args = _arguments.GetArguments<SelfHostingArguments>();
             return new SelfHostingOptions()
             {
-                Port = args.ValidationPort
+                Port = await HostingPort.GetValue(),
             };
+        }
+
+        public override IEnumerable<(CommandLineAttribute, object?)> Describe(SelfHostingOptions options)
+        {
+            yield return (_arguments.GetString<MainArguments>(x => x.ValidationMode).Meta, "tls-alpn-01");
+            yield return (HostingPort.Meta, options.Port);
         }
     }
 }

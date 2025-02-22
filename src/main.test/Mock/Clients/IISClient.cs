@@ -88,40 +88,39 @@ namespace PKISharp.WACS.UnitTests.Mock.Clients
         public Version Version { get; set; }
         public MockSite[] MockSites { get; set; }
 
-        IEnumerable<IIISSite> IIISClient.FtpSites => FtpSites;
-        IEnumerable<IIISSite> IIISClient.WebSites => WebSites;
+        IEnumerable<IIISSite> IIISClient.Sites => Sites;
+        public IEnumerable<MockSite> Sites => MockSites;
 
-        public IEnumerable<MockSite> FtpSites => new List<MockSite>();
-        public IEnumerable<MockSite> WebSites => MockSites;
+        public bool HasFtpSites => Sites.Any(x => x.Type == IISSiteType.Ftp);
+        public bool HasWebSites => Sites.Any(x => x.Type == IISSiteType.Web);
 
-        public bool HasFtpSites => FtpSites.Count() > 0;
-        public bool HasWebSites => WebSites.Count() > 0;
-
-        public void AddOrUpdateBindings(IEnumerable<string> identifiers, BindingOptions bindingOptions, byte[] oldThumbprint)
+        public void UpdateHttpSite(IEnumerable<Identifier> identifiers, BindingOptions bindingOptions, byte[]? oldCertificate = null, IEnumerable<Identifier>? allIdentifiers = null)
         {
             var updater = new IISHttpBindingUpdater<MockSite, MockBinding>(this, _log);
-            var updated = updater.AddOrUpdateBindings(identifiers, bindingOptions, oldThumbprint);
+            var updated = updater.AddOrUpdateBindings(identifiers, bindingOptions, allIdentifiers, oldCertificate);
             if (updated > 0)
             {
-                _log.Information("Committing {count} {type} binding changes to IIS", updated, "https");
+                _log.Information("Committing {count} {type} binding changes to IIS while updating site {site}", updated, "https", bindingOptions.SiteId);
 
             }
             else
             {
-                _log.Warning("No bindings have been changed");
+                _log.Information("No bindings have been changed while updating site {site}", bindingOptions.SiteId);
             }
         }
-        public MockSite GetFtpSite(long id) => FtpSites.First(x => id == x.Id);
-        public MockSite GetWebSite(long id) => WebSites.First(x => id == x.Id);
-        public void UpdateFtpSite(long FtpSiteId, CertificateInfo newCertificate, CertificateInfo oldCertificate) { }
-        IIISSite IIISClient.GetFtpSite(long id) => GetFtpSite(id);
-        IIISSite IIISClient.GetWebSite(long id) => GetWebSite(id);
+        public MockSite GetSite(long id, IISSiteType? type = null) => Sites.First(x => id == x.Id && (type == null || x.Type == type));
+        public void UpdateFtpSite(long? FtpSiteId, string? store, ICertificateInfo newCertificate, ICertificateInfo? oldCertificate) { }
+        IIISSite IIISClient.GetSite(long id, IISSiteType? type) => GetSite(id, type);
 
-        public void AddBinding(MockSite site, BindingOptions bindingOptions) => site.Bindings.Add(new MockBinding(bindingOptions));
+        public IIISBinding AddBinding(MockSite site, BindingOptions bindingOptions) {
+            var newBinding = new MockBinding(bindingOptions);
+            site.Bindings.Add(newBinding);
+            return newBinding;
+        } 
 
         public void UpdateBinding(MockSite site, MockBinding binding, BindingOptions bindingOptions)
         {
-            site.Bindings.Remove(binding);
+            _ = site.Bindings.Remove(binding);
             var updateOptions = bindingOptions
                 .WithHost(binding.Host)
                 .WithIP(binding.IP)
@@ -132,16 +131,21 @@ namespace PKISharp.WACS.UnitTests.Mock.Clients
         public void Refresh()
         {
         }
+        public void ReplaceCertificate(CertificateInfo newCertificate, CertificateInfo oldCertificate)
+        {
+            throw new NotImplementedException();
+        }
     }
 
     internal class MockSite : IIISSite<MockBinding>
     {
         IEnumerable<IIISBinding> IIISSite.Bindings => Bindings;
-        public List<MockBinding> Bindings { get; set; }
+        public List<MockBinding> Bindings { get; set; } = new List<MockBinding>();
         public long Id { get; set; }
-        public string Name { get; set; }
-        public string Path { get; set; }
+        public string Name { get; set; } = "";
+        public string Path { get; set; } = "";
         IEnumerable<MockBinding> IIISSite<MockBinding>.Bindings => Bindings;
+        public IISSiteType Type => IISSiteType.Web;
     }
 
     internal class MockBinding : IIISBinding
@@ -152,19 +156,35 @@ namespace PKISharp.WACS.UnitTests.Mock.Clients
             Host = options.Host;
             Protocol = "https";
             Port = options.Port;
-            CertificateHash = options.Thumbprint;
-            CertificateStoreName = options.Store;
+            CertificateHash = options.Thumbprint?.ToArray();
+            CertificateStoreName = options.Store ?? "";
             IP = options.IP;
             SSLFlags = options.Flags;
         }
 
-        public string Host { get; set; }
-        public string Protocol { get; set; }
+        public string Host { get; set; } = "";
+        public string Protocol { get; set; } = "";
         public int Port { get; set; }
-        public string IP { get; set; }
-        public byte[] CertificateHash { get; set; }
-        public string CertificateStoreName { get; set; }
-        public string BindingInformation => $"{IP}:{Port}:{Host}";
+        public string IP { get; set; } = "";
+        public byte[]? CertificateHash { get; set; }
+        public string CertificateStoreName { get; set; } = "";
+        public string BindingInformation
+        {
+            get
+            {
+                if (_bindingInformation != null)
+                {
+                    return _bindingInformation;
+                }
+                else
+                {
+                    return $"{IP}:{Port}:{Host}";
+                }
+            }
+            set => _bindingInformation = value;
+        }
+        private string? _bindingInformation = null;
         public SSLFlags SSLFlags { get; set; }
+        public bool Secure => Protocol == "https" || Protocol == "ftps";
     }
 }

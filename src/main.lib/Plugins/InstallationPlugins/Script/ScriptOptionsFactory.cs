@@ -1,62 +1,71 @@
-﻿using PKISharp.WACS.DomainObjects;
+﻿using PKISharp.WACS.Configuration;
 using PKISharp.WACS.Extensions;
 using PKISharp.WACS.Plugins.Base.Factories;
 using PKISharp.WACS.Plugins.StorePlugins;
 using PKISharp.WACS.Services;
-using System;
+using System.Collections.Generic;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Plugins.InstallationPlugins
 {
-    internal class ScriptOptionsFactory : InstallationPluginFactory<Script, ScriptOptions>
+    internal class ScriptOptionsFactory : PluginOptionsFactory<ScriptOptions>
     {
         public override int Order => 100;
         private readonly ILogService _log;
-        private readonly IArgumentsService _arguments;
+        private readonly ArgumentsInputService _arguments;
 
-        public ScriptOptionsFactory(ILogService log, IArgumentsService arguments)
+        public ScriptOptionsFactory(ILogService log, ArgumentsInputService arguments)
         {
             _log = log;
             _arguments = arguments;
         }
+        private ArgumentResult<string?> Script => _arguments.
+            GetString<ScriptArguments>(x => x.Script).
+            Validate(x => Task.FromResult(x.ValidFile(_log)), "invalid path").
+            Validate(x => Task.FromResult(x!.EndsWith(".ps1") || x!.EndsWith(".exe") || x!.EndsWith(".bat") || x!.EndsWith(".cmd")), "invalid extension").
+            Required();
 
-        public override async Task<ScriptOptions> Aquire(Target target, IInputService inputService, RunLevel runLevel)
+        private ArgumentResult<string?> Parameters => _arguments.
+            GetString<ScriptArguments>(x => x.ScriptParameters);
+
+        public override async Task<ScriptOptions?> Aquire(IInputService inputService, RunLevel runLevel)
         {
-            var ret = new ScriptOptions();
-            var args = _arguments.GetArguments<ScriptArguments>();
-            inputService.Show("Full instructions", "https://pkisharp.github.io/win-acme/reference/plugins/installation/script");
-            do
+            var ret = new ScriptOptions
             {
-                ret.Script = await _arguments.TryGetArgument(args.Script, inputService, "Enter the path to the script that you want to run after renewal");
-            }
-            while (!ret.Script.ValidFile(_log));
-
+                Script = await Script.Interactive(inputService, "File").GetValue(),
+            };
+            inputService.CreateSpace();
             inputService.Show("{CertCommonName}", "Common name (primary domain name)");
             inputService.Show("{CachePassword}", ".pfx password");
             inputService.Show("{CacheFile}", ".pfx full path");
             inputService.Show("{CertFriendlyName}", "Certificate friendly name");
             inputService.Show("{CertThumbprint}", "Certificate thumbprint");
-            inputService.Show("{StoreType}", $"Type of store ({CentralSslOptions.PluginName}/{CertificateStoreOptions.PluginName}/{PemFilesOptions.PluginName})");
+            inputService.Show("{StoreType}", $"Type of store (e.g. {CentralSsl.Name}, {CertificateStore.Name}, {PemFiles.Name}, ...)");
             inputService.Show("{StorePath}", "Path to the store");
             inputService.Show("{RenewalId}", "Renewal identifier");
-
-            ret.ScriptParameters = await _arguments.TryGetArgument(args.ScriptParameters, inputService, "Enter the parameter format string for the script, e.g. \"--hostname {CertCommonName}\"");
+            inputService.Show("{OldCertCommonName}", "Common name (primary domain name) of the previously issued certificate");
+            inputService.Show("{OldCertFriendlyName}", "Friendly name of the previously issued certificate");
+            inputService.Show("{OldCertThumbprint}", "Thumbprint of the previously issued certificate");
+            inputService.Show("{vault://json/mysecret}", "Secret from the vault");
+            inputService.CreateSpace();
+            ret.ScriptParameters = await Parameters.Interactive(inputService, "Parameters").GetValue();
             return ret;
         }
 
-        public override Task<ScriptOptions> Default(Target target)
+        public override async Task<ScriptOptions?> Default()
         {
-            var args = _arguments.GetArguments<ScriptArguments>();
-            var ret = new ScriptOptions
+            return new ScriptOptions
             {
-                Script = _arguments.TryGetRequiredArgument(nameof(args.Script), args.Script)
+                Script = await Script.GetValue(),
+                ScriptParameters = await Parameters.GetValue()
             };
-            if (!ret.Script.ValidFile(_log))
-            {
-                throw new ArgumentException(nameof(args.Script));
-            }
-            ret.ScriptParameters = args.ScriptParameters;
-            return Task.FromResult(ret);
+        }
+
+        public override IEnumerable<(CommandLineAttribute, object?)> Describe(ScriptOptions options)
+        {
+            yield return (Script.Meta, options.Script);
+            yield return (Parameters.Meta, options.ScriptParameters);
         }
     }
 }

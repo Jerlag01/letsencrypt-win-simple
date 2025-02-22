@@ -1,8 +1,10 @@
 ﻿using Microsoft.VisualStudio.TestTools.UnitTesting;
 using PKISharp.WACS.Clients.IIS;
+using PKISharp.WACS.DomainObjects;
 using PKISharp.WACS.Services;
 using PKISharp.WACS.UnitTests.Mock.Clients;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -56,11 +58,11 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.SNI, 10)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL, 10)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl, 10)]
         // Unsupported flags
         [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.None, SSLFlags.None, 7)]
         [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.SNI, SSLFlags.None, 7)]
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.None, 7)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.None, 7)]
         public void AddNewSingle(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags, int iisVersion)
         {
             var iis = new MockIISClient(log, iisVersion)
@@ -85,18 +87,25 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithIP(bindingIp).
                 WithPort(bindingPort).
                 WithStore(storeName).
-                WithFlags(inputFlags).
-                WithThumbprint(newCert);
+                WithFlags(inputFlags);
 
-            var httpOnlySite = iis.GetWebSite(httpOnlyId);
-            iis.AddOrUpdateBindings(new[] { testHost }, bindingOptions, oldCert1);
+            if (!inputFlags.HasFlag(SSLFlags.CentralSsl))
+            {
+                bindingOptions = bindingOptions.WithThumbprint(newCert);
+            }
+
+            var httpOnlySite = iis.GetSite(httpOnlyId);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(testHost) }, bindingOptions, oldCert1);
             Assert.AreEqual(2, httpOnlySite.Bindings.Count);
 
             var newBinding = httpOnlySite.Bindings[1];
             Assert.AreEqual(testHost, newBinding.Host);
             Assert.AreEqual("https", newBinding.Protocol);
             Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-            Assert.AreEqual(newCert, newBinding.CertificateHash);
+            if (!expectedFlags.HasFlag(SSLFlags.CentralSsl) && iisVersion > 7)
+            {
+                Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
+            }
             Assert.AreEqual(bindingPort, newBinding.Port);
             Assert.AreEqual(bindingIp, newBinding.IP);
             Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
@@ -115,11 +124,11 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.SNI, 10)]
         // Alternative flags
-        [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL, 10)]
+        [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl, 10)]
         // Unsupported flags
         [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.None, SSLFlags.None, 7)]
         [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.SNI, SSLFlags.None, 7)]
-        [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.None, 7)]
+        [DataRow(httpOnlyHost, httpOnlyHost, DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.None, 7)]
         public void AddNewMulti(string newHost, string existingHost, string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags, int iisVersion)
         {
             var iis = new MockIISClient(log, iisVersion)
@@ -158,7 +167,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            var httpOnlySite = iis.GetWebSite(httpOnlyId);
+            var httpOnlySite = iis.GetSite(httpOnlyId);
             var existingBindings = httpOnlySite.Bindings.ToList();
             var expectedNew = existingBindings.Select(x => x.IP + x.Host).Distinct().Count();
             if (bindingIp != DefaultIP)
@@ -166,21 +175,21 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 expectedNew = 1;
             }
        
-            iis.AddOrUpdateBindings(new[] { newHost }, bindingOptions, oldCert1);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(newHost) }, bindingOptions, oldCert1);
         
-            Assert.AreEqual(existingBindings.Count() + expectedNew, httpOnlySite.Bindings.Count);
+            Assert.AreEqual(existingBindings.Count + expectedNew, httpOnlySite.Bindings.Count);
 
             var newBindings = httpOnlySite.Bindings.Except(existingBindings);
-            newBindings.All(newBinding =>
-            {
-                Assert.AreEqual(existingHost, newBinding.Host);
-                Assert.AreEqual("https", newBinding.Protocol);
-                Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-                Assert.AreEqual(newCert, newBinding.CertificateHash);
-                Assert.AreEqual(bindingPort, newBinding.Port);
-                Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
-                return true;
-            });
+            _ = newBindings.All(newBinding =>
+              {
+                  Assert.AreEqual(existingHost, newBinding.Host);
+                  Assert.AreEqual("https", newBinding.Protocol);
+                  Assert.AreEqual(storeName, newBinding.CertificateStoreName);
+                  Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
+                  Assert.AreEqual(bindingPort, newBinding.Port);
+                  Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
+                  return true;
+              });
 
             var oldips = existingBindings.Select(x => x.IP).Distinct();
             var newips = newBindings.Select(x => x.IP).Distinct();
@@ -206,7 +215,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.SNI)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl)]
         public void AddNewMultiple(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags)
         {
             var originalBindings = new List<MockBinding> {
@@ -240,13 +249,16 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "site1.example.com", "site2.example.com" }, bindingOptions, oldCert1);
+            iis.UpdateHttpSite(new[] { 
+                new DnsIdentifier("site1.example.com"), 
+                new DnsIdentifier("site2.example.com")
+            }, bindingOptions, oldCert1);
             Assert.AreEqual(4, site.Bindings.Count);
             foreach (var newBinding in site.Bindings.Except(originalBindings))
             {
                 Assert.AreEqual("https", newBinding.Protocol);
                 Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-                Assert.AreEqual(newCert, newBinding.CertificateHash);
+                Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
                 Assert.AreEqual(bindingPort, newBinding.Port);
                 Assert.AreEqual(bindingIp, newBinding.IP);
                 Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
@@ -263,7 +275,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.SNI)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl)]
         public void AddMultipleWildcard(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags)
         {
             var originalBindings = new List<MockBinding> {
@@ -291,15 +303,18 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "site1.example.com", "site2.example.com" }, bindingOptions, oldCert1);
+            iis.UpdateHttpSite(new[] { 
+                new DnsIdentifier("site1.example.com"), 
+                new DnsIdentifier("site2.example.com") 
+            }, bindingOptions, oldCert1);
 
-            var expectedBindings = inputFlags.HasFlag(SSLFlags.CentralSSL) ? 3 : 2;
+            var expectedBindings = inputFlags.HasFlag(SSLFlags.CentralSsl) ? 3 : 2;
             Assert.AreEqual(expectedBindings, site.Bindings.Count);
             foreach (var newBinding in site.Bindings.Except(originalBindings))
             {
                 Assert.AreEqual("https", newBinding.Protocol);
                 Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-                Assert.AreEqual(newCert, newBinding.CertificateHash);
+                Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
                 Assert.AreEqual(bindingPort, newBinding.Port);
                 Assert.AreEqual(bindingIp, newBinding.IP);
                 Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
@@ -316,7 +331,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.None)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl)]
         public void UpdateWildcardFuzzy(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags)
         {
             var originalBindings = new List<MockBinding> {
@@ -345,15 +360,15 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "*.example.com" }, bindingOptions, oldCert1);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("*.example.com") }, bindingOptions, oldCert1);
 
-            var expectedBindings = inputFlags.HasFlag(SSLFlags.CentralSSL) ? 2 : 1;
+            var expectedBindings = inputFlags.HasFlag(SSLFlags.CentralSsl) ? 2 : 1;
             Assert.AreEqual(expectedBindings, site.Bindings.Count);
             foreach (var newBinding in site.Bindings.Except(originalBindings))
             {
                 Assert.AreEqual("https", newBinding.Protocol);
                 Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-                Assert.AreEqual(newCert, newBinding.CertificateHash);
+                Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
                 Assert.AreEqual(DefaultPort, newBinding.Port);
                 Assert.AreEqual(DefaultIP, newBinding.IP);
                 Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
@@ -370,7 +385,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.SNI)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.SNI | SSLFlags.CentralSSL)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.SNI | SSLFlags.CentralSsl)]
         public void AddMultipleWildcard2(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags)
         {
             var originalBindings = new List<MockBinding> {
@@ -398,7 +413,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "*.example.com" }, bindingOptions, oldCert1);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("*.example.com") }, bindingOptions, oldCert1);
 
             var expectedBindings = 2;
             Assert.AreEqual(expectedBindings, site.Bindings.Count);
@@ -406,7 +421,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
             {
                 Assert.AreEqual("https", newBinding.Protocol);
                 Assert.AreEqual(storeName, newBinding.CertificateStoreName);
-                Assert.AreEqual(newCert, newBinding.CertificateHash);
+                Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
                 Assert.AreEqual(bindingPort, newBinding.Port);
                 Assert.AreEqual(bindingIp, newBinding.IP);
                 Assert.AreEqual(expectedFlags, newBinding.SSLFlags);
@@ -423,7 +438,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         // Alternative port
         [DataRow(DefaultStore, DefaultIP, AltPort, SSLFlags.None, SSLFlags.None)]
         // Alternative flags
-        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSSL, SSLFlags.CentralSSL)]
+        [DataRow(DefaultStore, DefaultIP, DefaultPort, SSLFlags.CentralSsl, SSLFlags.CentralSsl)]
         public void UpdateSimple(string storeName, string bindingIp, int bindingPort, SSLFlags inputFlags, SSLFlags expectedFlags)
         {
             var iis = new MockIISClient(log)
@@ -460,22 +475,141 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithFlags(inputFlags).
                 WithThumbprint(newCert);
 
-            var regularSite = iis.GetWebSite(regularId);
-            iis.AddOrUpdateBindings(new[] { regularHost }, bindingOptions, oldCert1);
+            var regularSite = iis.GetSite(regularId);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(regularHost) }, bindingOptions, oldCert1);
             Assert.AreEqual(2, regularSite.Bindings.Count);
 
             var updatedBinding = regularSite.Bindings[1];
             Assert.AreEqual(regularHost, updatedBinding.Host);
             Assert.AreEqual("https", updatedBinding.Protocol);
             Assert.AreEqual(storeName, updatedBinding.CertificateStoreName);
-            Assert.AreEqual(newCert, updatedBinding.CertificateHash);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, updatedBinding.CertificateHash));
             Assert.AreEqual(AltPort, updatedBinding.Port);
             Assert.AreEqual(AltIP, updatedBinding.IP);
             Assert.AreEqual(expectedFlags, updatedBinding.SSLFlags);
         }
 
         [TestMethod]
-        public void UpdateOutOfScope()
+        // Basic
+        [DataRow(
+            SSLFlags.CentralSsl, 
+            SSLFlags.CentralSsl, 
+            SSLFlags.CentralSsl)]
+        [DataRow(
+            SSLFlags.SNI | SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp, 
+            SSLFlags.None,
+            SSLFlags.SNI | SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp)]
+        // Change store
+        [DataRow(
+            SSLFlags.SNI | SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp,
+            SSLFlags.CentralSsl,
+            SSLFlags.SNI | SSLFlags.CentralSsl)]
+        [DataRow(
+            SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp,
+            SSLFlags.CentralSsl,
+            SSLFlags.CentralSsl)]
+        // Set SNI
+        [DataRow(
+            SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp,
+            SSLFlags.SNI,
+            SSLFlags.SNI | SSLFlags.DisableHttp2 | SSLFlags.DisableTls13OverTcp)]
+        [DataRow(
+            SSLFlags.CentralSsl,
+            SSLFlags.SNI | SSLFlags.CentralSsl,
+            SSLFlags.SNI | SSLFlags.CentralSsl)]
+         public void PreserveFlags(SSLFlags initialFlags, SSLFlags inputFlags, SSLFlags expectedFlags)
+        {
+            var iis = new MockIISClient(log)
+            {
+                MockSites = new[] {
+                new MockSite() {
+                    Id = regularId,
+                    Bindings = new List<MockBinding> {
+                        new MockBinding() {
+                            IP = AltIP,
+                            Port = AltPort,
+                            Host = "host.nl",
+                            Protocol = "https",
+                            CertificateHash = oldCert1,
+                            CertificateStoreName = AltStore,
+                            SSLFlags = initialFlags
+                        }
+                    }
+                }
+            }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithSiteId(regularId).
+                WithFlags(inputFlags).
+                WithThumbprint(newCert);
+
+            var regularSite = iis.GetSite(regularId);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("host.nl") }, bindingOptions, oldCert1);
+            Assert.AreEqual(1, regularSite.Bindings.Count);
+
+            var updatedBinding = regularSite.Bindings.FirstOrDefault();
+            Assert.IsNotNull(updatedBinding);
+            Assert.AreEqual("https", updatedBinding?.Protocol);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, updatedBinding?.CertificateHash));
+            Assert.AreEqual(expectedFlags, updatedBinding?.SSLFlags);
+        }
+
+        [TestMethod]
+        public void UpdateOutOfScopeCatchAll()
+        {
+            var iis = new MockIISClient(log)
+            {
+                MockSites = new[] {
+                    new MockSite() {
+                        Id = inscopeId,
+                        Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = DefaultIP,
+                                Port = DefaultPort,
+                                Host = inscopeHost,
+                                Protocol = "https",
+                                CertificateHash = scopeCert,
+                                CertificateStoreName = DefaultStore,
+                                SSLFlags = SSLFlags.SNI
+                            }
+                        }
+                    },
+                    new MockSite() {
+                        Id = outofscopeId,
+                        Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = DefaultIP,
+                                Port = DefaultPort,
+                                Host = "",
+                                Protocol = "https",
+                                CertificateHash = scopeCert,
+                                CertificateStoreName = DefaultStore,
+                                SSLFlags = SSLFlags.SNI
+                            }
+                        }
+                    }
+                }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithSiteId(inscopeId).
+                WithIP(DefaultIP).
+                WithPort(DefaultPort).
+                WithStore(DefaultStore).
+                WithThumbprint(newCert);
+
+            var outofScopeSite = iis.GetSite(outofscopeId);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(regularHost) }, bindingOptions, scopeCert);
+            Assert.AreEqual(outofScopeSite.Bindings.Count, 1);
+
+            var updatedBinding = outofScopeSite.Bindings[0];
+            Assert.AreEqual(DefaultStore, updatedBinding.CertificateStoreName);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, updatedBinding.CertificateHash));
+        }
+
+        [TestMethod]
+        public void UpdateOutOfScopeRegular()
         {
             var iis = new MockIISClient(log)
             {
@@ -518,13 +652,13 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            var outofScopeSite = iis.GetWebSite(outofscopeId);
-            iis.AddOrUpdateBindings(new[] { regularHost }, bindingOptions, scopeCert);
-            Assert.AreEqual(1, outofScopeSite.Bindings.Count);
+            var outofScopeSite = iis.GetSite(outofscopeId);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(regularHost) }, bindingOptions, scopeCert);
+            Assert.AreEqual(outofScopeSite.Bindings.Count, 1);
 
             var updatedBinding = outofScopeSite.Bindings[0];
             Assert.AreEqual(DefaultStore, updatedBinding.CertificateStoreName);
-            Assert.AreEqual(newCert, updatedBinding.CertificateHash);
+            Assert.AreEqual(scopeCert, updatedBinding.CertificateHash);
         }
 
         [TestMethod]
@@ -539,13 +673,13 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
         [DataRow("*.b.c.com", new[] { "*.b.c.com" }, "a.b.c.com", SSLFlags.None)]
         [DataRow("*.b.c.com", new[] { "a.b.c.com", "*.b.c.com", "*.c.com", "*.com", "" }, "*.b.c.com", SSLFlags.None)]
 
-        [DataRow("a.b.c.com", new[] { "a.b.c.com" }, "a.b.c.com", SSLFlags.CentralSSL)]
-        [DataRow("a.b.c.com", new[] { "a.b.c.com", "*.b.c.com" }, "a.b.c.com", SSLFlags.CentralSSL)]
+        [DataRow("a.b.c.com", new[] { "a.b.c.com" }, "a.b.c.com", SSLFlags.CentralSsl)]
+        [DataRow("a.b.c.com", new[] { "a.b.c.com", "*.b.c.com" }, "a.b.c.com", SSLFlags.CentralSsl)]
 
-        [DataRow("*.b.c.com", new string[] { }, "*.b.c.com", SSLFlags.CentralSSL)]
-        [DataRow("*.b.c.com", new[] { "*.b.c.com" }, "*.b.c.com", SSLFlags.CentralSSL)]
-        [DataRow("*.b.c.com", new[] { "a.b.c.com", "*.b.c.com", "*.c.com", "*.com" }, "*.b.c.com", SSLFlags.CentralSSL)]
-        [DataRow("*.b.c.com", new[] { "a.b.c.com", "*.b.c.com", "*.c.com", "*.com", "" }, "*.b.c.com", SSLFlags.CentralSSL)]
+        [DataRow("*.b.c.com", new string[] { }, "*.b.c.com", SSLFlags.CentralSsl)]
+        [DataRow("*.b.c.com", new[] { "*.b.c.com" }, "*.b.c.com", SSLFlags.CentralSsl)]
+        [DataRow("*.b.c.com", new[] { "a.b.c.com", "*.b.c.com", "*.c.com", "*.com" }, "*.b.c.com", SSLFlags.CentralSsl)]
+        [DataRow("*.b.c.com", new[] { "a.b.c.com", "*.b.c.com", "*.c.com", "*.com", "" }, "*.b.c.com", SSLFlags.CentralSsl)]
         public void UpdatePiramid(string certificateHost, string[] ignoreBindings, string expectedBinding, SSLFlags flags)
         {
             var iis = new MockIISClient(log)
@@ -603,10 +737,10 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithThumbprint(newCert).
                 WithFlags(flags);
 
-            var piramidSite = iis.GetWebSite(piramidId);
+            var piramidSite = iis.GetSite(piramidId);
             var originalSet = piramidSite.Bindings.Where(x => !ignoreBindings.Contains(x.Host)).ToList();
             piramidSite.Bindings = originalSet.ToList().OrderBy(x => Guid.NewGuid()).ToList();
-            iis.AddOrUpdateBindings(new[] { certificateHost }, bindingOptions, scopeCert);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(certificateHost) }, bindingOptions, scopeCert);
 
             var newBindings = piramidSite.Bindings.Except(originalSet);
             Assert.AreEqual(1, newBindings.Count());
@@ -645,9 +779,9 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "*.b.c.com" }, bindingOptions, scopeCert);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("*.b.c.com") }, bindingOptions, scopeCert);
 
-            Assert.AreEqual(expectedBindings, site.Bindings.Count());
+            Assert.AreEqual(expectedBindings, site.Bindings.Count);
         }
 
         /// <summary>
@@ -699,12 +833,12 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            var sniTrap1Site = iis.GetWebSite(sniTrap1);
-            iis.AddOrUpdateBindings(new[] { sniTrapHost }, bindingOptions, scopeCert);
+            var sniTrap1Site = iis.GetSite(sniTrap1);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(sniTrapHost) }, bindingOptions, scopeCert);
 
             var updatedBinding = sniTrap1Site.Bindings[0];
             Assert.AreEqual(SSLFlags.SNI, updatedBinding.SSLFlags);
-            Assert.AreEqual(newCert, updatedBinding.CertificateHash);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, updatedBinding.CertificateHash));
         }
 
         /// <summary>
@@ -755,12 +889,109 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            var sniTrap2Site = iis.GetWebSite(sniTrap2);
-            iis.AddOrUpdateBindings(new[] { sniTrapHost }, bindingOptions, scopeCert);
+            var sniTrap2Site = iis.GetSite(sniTrap2);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(sniTrapHost) }, bindingOptions, scopeCert);
 
-            var updatedBinding = sniTrap2Site.Bindings[0];
-            Assert.AreEqual(SSLFlags.None, updatedBinding.SSLFlags);
-            Assert.AreEqual(oldCert1, updatedBinding.CertificateHash);
+            var untouchedBinding = sniTrap2Site.Bindings[0];
+            Assert.AreEqual(SSLFlags.None, untouchedBinding.SSLFlags);
+            Assert.AreEqual(oldCert1, untouchedBinding.CertificateHash);
+            Assert.AreEqual(1, sniTrap2Site.Bindings.Count);
+        }
+
+        /// <summary>
+        /// Like above, but the new domain is different so a separate binding should
+        /// be created for it
+        /// </summary>
+        [TestMethod]
+        public void SNITrap3()
+        {
+            var iis = new MockIISClient(log)
+            {
+                MockSites = new[] {
+                    new MockSite() {
+                        Id = sniTrap1,
+                        Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = DefaultIP,
+                                Port = DefaultPort,
+                                Host = sniTrapHost,
+                                Protocol = "https",
+                                CertificateHash = oldCert1,
+                                CertificateStoreName = DefaultStore,
+                                SSLFlags = SSLFlags.None
+                            }
+                        }
+                    },
+                    new MockSite() {
+                        Id = sniTrap2,
+                        Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = DefaultIP,
+                                Port = DefaultPort,
+                                Host = "",
+                                Protocol = "https",
+                                CertificateHash = oldCert1,
+                                CertificateStoreName = DefaultStore,
+                                SSLFlags = SSLFlags.None
+                            }
+                        }
+                    },
+                }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithSiteId(sniTrap2).
+                WithIP(DefaultIP).
+                WithPort(DefaultPort).
+                WithStore(DefaultStore).
+                WithThumbprint(newCert);
+
+            var sniTrap2Site = iis.GetSite(sniTrap2);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("example.com") }, bindingOptions, scopeCert);
+
+            var untouchedBinding = sniTrap2Site.Bindings[0];
+            Assert.AreEqual(SSLFlags.None, untouchedBinding.SSLFlags);
+            Assert.AreEqual(oldCert1, untouchedBinding.CertificateHash);
+            Assert.AreEqual(2, sniTrap2Site.Bindings.Count);
+            var newBinding = sniTrap2Site.Bindings[1];
+            Assert.AreEqual(SSLFlags.SNI, newBinding.SSLFlags);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, newBinding.CertificateHash));
+        }
+
+
+        /// <summary>
+        /// Like above, but SNI cannot be turned on for the default
+        /// website / empty host. The code should ignore the change.
+        /// </summary>
+        [TestMethod]
+        public void CentralSSLTrap()
+        {
+            var iis = new MockIISClient(log)
+            {
+                MockSites = new[] {
+                    new MockSite() {
+                        Id = 1,
+                        Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = DefaultIP,
+                                Port = DefaultPort,
+                                Host = "",
+                                Protocol = "http"
+                            }
+                        }
+                    }
+                }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithSiteId(1).
+                WithIP(DefaultIP).
+                WithPort(DefaultPort).
+                WithFlags(SSLFlags.CentralSsl);
+
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("mail.example.com") }, bindingOptions, null);
+
+            Assert.IsTrue(true);
         }
 
         [TestMethod]
@@ -807,7 +1038,7 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "exists.example.com" }, bindingOptions, scopeCert);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("exists.example.com") }, bindingOptions, scopeCert);
             Assert.AreEqual(1, dup2.Bindings.Count);
         }
 
@@ -857,8 +1088,155 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "new.example.com" }, bindingOptions, scopeCert);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("new.example.com") }, bindingOptions, scopeCert);
             Assert.AreEqual(expectedBindings, dup2.Bindings.Count);
+        }
+        [TestMethod]
+        public void MultipleDontCreate()
+        {
+            var dup1 = new MockSite()
+            {
+                Id = 1,
+                Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = "*",
+                                Port = 8080,
+                                Host = "wacs1.test.net",
+                                Protocol = "https",
+                                SSLFlags = SSLFlags.None,
+                                CertificateHash = oldCert1,
+                                CertificateStoreName = DefaultStore
+                            }
+                        }
+            };
+
+            var dup2 = new MockSite()
+            {
+                Id = 2,
+                Bindings = new List<MockBinding> {
+                    new MockBinding() {
+                        IP = "*",
+                        Port = 444,
+                        Host = "wacs1.test.net",
+                        Protocol = "https",
+                        SSLFlags = SSLFlags.SNI,
+                        CertificateHash = oldCert1,
+                        CertificateStoreName = DefaultStore
+                    }
+                }
+            };
+
+            var iis = new MockIISClient(log, 10)
+            {
+                MockSites = new[] { dup1, dup2 }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithFlags(SSLFlags.None).
+                WithStore(DefaultStore).
+                WithThumbprint(newCert);
+
+            log.Information("Site 1");
+            iis.UpdateHttpSite(new[] {
+                new DnsIdentifier("wacs1.test.net")
+            },
+            bindingOptions.WithSiteId(1),
+            oldCert1);
+
+            log.Information("Site 2");
+
+            iis.UpdateHttpSite(new[] {
+                new DnsIdentifier("wacs1.test.net")
+            },
+            bindingOptions.WithSiteId(2),
+            oldCert1);
+
+            Assert.AreEqual(1, dup2.Bindings.Count);
+        }
+
+        [TestMethod]
+        public void MultipleNonSNI()
+        {
+            var dup1 = new MockSite()
+            {
+                Id = 1,
+                Bindings = new List<MockBinding> {
+                            new MockBinding() {
+                                IP = "*",
+                                Port = 80,
+                                Host = "wacs1.test.net",
+                                Protocol = "http"
+                            },
+                            new MockBinding() {
+                                IP = "*",
+                                Port = 443,
+                                Host = "wacs1.test.net",
+                                Protocol = "https",
+                                SSLFlags = SSLFlags.None,
+                                CertificateHash = oldCert1,
+                                CertificateStoreName = DefaultStore
+                            }
+                        }
+            };
+
+            var dup2 = new MockSite()
+            {
+                Id = 2,
+                Bindings = new List<MockBinding> {
+                    new MockBinding() {
+                        IP = "*",
+                        Port = 80,
+                        Host = "wacs2.test.net",
+                        Protocol = "http"
+                    },
+                    new MockBinding() {
+                        IP = "*",
+                        Port = 443,
+                        Host = "wacs2.test.net",
+                        Protocol = "https",
+                        SSLFlags = SSLFlags.None,
+                        CertificateHash = oldCert1,
+                        CertificateStoreName = DefaultStore
+                    },
+                    new MockBinding() {
+                        IP = "*",
+                        Port = 443,
+                        Host = "wacs2alt.test.net",
+                        Protocol = "https",
+                        SSLFlags = SSLFlags.None,
+                        CertificateHash = oldCert1,
+                        CertificateStoreName = DefaultStore
+                    }
+                }
+            };
+
+            var iis = new MockIISClient(log, 10)
+            {
+                MockSites = new[] { dup1, dup2 }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithFlags(SSLFlags.None).
+                WithStore(DefaultStore).
+                WithThumbprint(newCert);
+
+            iis.UpdateHttpSite(new[] { 
+                new DnsIdentifier("wacs1.test.net"), 
+                new DnsIdentifier("wacs2.test.net"), 
+                new DnsIdentifier("wacs2alt.test.net") 
+            },
+            bindingOptions.WithSiteId(1),
+            oldCert1);
+
+            log.Information("Site 2");
+
+            iis.UpdateHttpSite(new[] {
+                new DnsIdentifier("wacs1.test.net"),
+                new DnsIdentifier("wacs2.test.net"),
+                new DnsIdentifier("wacs2alt.test.net")
+            },
+            bindingOptions.WithSiteId(2),
+            oldCert1);
         }
 
         [DataRow(7, "")]
@@ -903,9 +1281,60 @@ namespace PKISharp.WACS.UnitTests.Tests.BindingTests
                 WithStore(DefaultStore).
                 WithThumbprint(newCert);
 
-            iis.AddOrUpdateBindings(new[] { "exists.example.com" }, bindingOptions, oldCert1);
-            Assert.AreEqual(iis.WebSites.First().Bindings.First().CertificateHash , newCert);
-            Assert.AreEqual(iis.WebSites.First().Bindings.Last().CertificateHash, newCert);
+            iis.UpdateHttpSite(new[] { new DnsIdentifier("exists.example.com") }, bindingOptions, oldCert1);
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, iis.Sites.First().Bindings.First().CertificateHash));
+            Assert.IsTrue(StructuralComparisons.StructuralEqualityComparer.Equals(newCert, iis.Sites.First().Bindings.Last().CertificateHash));
+        }
+
+        [TestMethod]
+        [DataRow("UPPERCASE.example.com", "UPPERCASE.example.com", "UPPERCASE.example.com")]
+        [DataRow("uppercase.example.com", "UPPERCASE.example.com", "UPPERCASE.example.com")]
+        [DataRow("UPPERCASE.example.com", "uppercase.example.com", "UPPERCASE.example.com")]
+        [DataRow("UPPERCASE.example.com", "UPPERCASE.example.com", "uppercase.example.com")]
+        [DataRow("UPPERCASE.example.com", "uppercase.example.com", "uppercase.example.com")]
+        [DataRow("uppercase.example.com", "UPPERCASE.example.com", "uppercase.example.com")]
+        [DataRow("uppercase.example.com", "uppercase.example.com", "UPPERCASE.example.com")]
+        [DataRow("uppercase.example.com", "uppercase.example.com", "uppercase.example.com")]
+        public void UppercaseBinding(string host, string bindingInfo, string newHost)
+        {
+            var mockBinding = new MockBinding()
+            {
+                IP = "*",
+                Port = 443,
+                Host = host,
+                Protocol = "https",
+                CertificateHash = oldCert1,
+                CertificateStoreName = DefaultStore
+            };
+            mockBinding.BindingInformation = $"*:443:{bindingInfo}";
+
+            var dup1 = new MockSite()
+            {
+                Id = 1,
+                Bindings = new List<MockBinding> { 
+                    mockBinding, 
+                    new MockBinding()
+                    {
+                        IP = "*",
+                        Port = 80,
+                        Host = host,
+                        Protocol = "http"
+                    }
+                }
+            };
+
+            var iis = new MockIISClient(log, 10)
+            {
+                MockSites = new[] { dup1 }
+            };
+
+            var bindingOptions = new BindingOptions().
+                WithSiteId(1).
+                WithStore(DefaultStore).
+                WithThumbprint(newCert);
+
+            iis.UpdateHttpSite(new[] { new DnsIdentifier(host), new DnsIdentifier(newHost) }, bindingOptions, null);
+            Assert.AreEqual(2, iis.Sites.First().Bindings.Count);
         }
     }
 }

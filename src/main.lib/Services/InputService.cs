@@ -1,4 +1,5 @@
-﻿using System;
+﻿using PKISharp.WACS.Configuration.Arguments;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -9,13 +10,13 @@ namespace PKISharp.WACS.Services
 {
     public class InputService : IInputService
     {
-        private readonly IArgumentsService _arguments;
+        private readonly MainArguments _arguments;
         private readonly ILogService _log;
         private readonly ISettingsService _settings;
         private const string _cancelCommand = "C";
         private bool _dirty;
 
-        public InputService(IArgumentsService arguments, ISettingsService settings, ILogService log)
+        public InputService(MainArguments arguments, ISettingsService settings, ILogService log)
         {
             _log = log;
             _arguments = arguments;
@@ -24,92 +25,128 @@ namespace PKISharp.WACS.Services
 
         private void Validate(string what)
         {
-            if (_arguments.MainArguments.Renew && !_arguments.MainArguments.Test)
+            if (_arguments.Renew && !_arguments.Test)
             {
                 throw new Exception($"User input '{what}' should not be needed in --renew mode.");
             }
         }
 
-        protected void CreateSpace(bool force = false)
+        public void CreateSpace()
         {
             if (_log.Dirty || _dirty)
             {
                 _log.Dirty = false;
                 _dirty = false;
-                Console.WriteLine();
-            }
-            else if (force)
-            {
-                Console.WriteLine();
+                WriteLine();
             }
         }
 
-        public Task<bool> Wait(string message = "Press enter to continue...")
+        private void WriteLine(string? text = "", ConsoleColor? color = null)
+        {
+            text ??= "";
+            var size = -1;
+            if (!Console.IsOutputRedirected)
+            {
+                size = Console.WindowWidth - 1;
+                if (size != Console.CursorLeft + 1)
+                {
+                    size -= Console.CursorLeft;
+                }
+                if (size < text.Length)
+                {
+                    size = Console.WindowWidth + size;
+                }
+            }
+            if (size < 0)
+            {
+                size = text.Length;
+            }
+            Write($"{text.PadRight(size)}\n", color);
+        }
+
+        private const string Black = "\u001b[40m";
+        private const string Reset = "\u001b[0m";
+        private void Write(string? text = "", ConsoleColor? color = null)
+        {
+            text ??= "";
+            if (color != null)
+            {
+                Console.ForegroundColor = color.Value;
+            }
+            if (Environment.OSVersion.Version.Major >= 10 && 
+                _settings.UI?.Color?.Background == "black")
+            {
+                text = $"{Black}{text}{Reset}";
+            }
+            Console.Write(text);
+            Console.ResetColor();
+        }
+
+        public Task<bool> Continue(string message = "Press <Space> to continue...")
         {
             Validate(message);
             CreateSpace();
-            Console.Write($" {message} ");
+            Write($" {message} ");
+            while (true)
+            {
+                var response = Console.ReadKey(true);
+                switch (response.Key)
+                {
+                    case ConsoleKey.Spacebar:
+                        Console.SetCursorPosition(0, Console.CursorTop);
+                        Console.Write(new string(' ', Console.WindowWidth));
+                        Console.SetCursorPosition(0, Console.CursorTop);
+                        return Task.FromResult(true);
+                }
+            }
+        }
+
+        public Task<bool> Wait(string message = "Press <Enter> to continue...")
+        {
+            Validate(message);
+            CreateSpace();
+            Write($" {message} ");
             while (true)
             {
                 var response = Console.ReadKey(true);
                 switch (response.Key)
                 {
                     case ConsoleKey.Enter:
-                        Console.WriteLine();
-                        Console.WriteLine();
+                        WriteLine();
+                        WriteLine();
                         return Task.FromResult(true);
                     case ConsoleKey.Escape:
-                        Console.WriteLine();
-                        Console.WriteLine();
+                        WriteLine();
+                        WriteLine();
                         return Task.FromResult(false);
+                    default:
+                        _log.Verbose("Unexpected key {key} pressed", response.Key);
+                        continue;
                 }
             }
         }
 
-        public async Task<string> RequestString(string[] what)
+        public void Show(string? label, string? value, int level = 0)
         {
-            if (what != null)
-            {
-                CreateSpace();
-                Console.ForegroundColor = ConsoleColor.Green;
-                for (var i = 0; i < what.Length - 1; i++)
-                {
-                    Console.WriteLine($" {what[i]}");
-                }
-                Console.ResetColor();
-                return await RequestString(what[^1]);
-            }
-            return "";
-        }
-
-        public void Show(string? label, string? value, bool newLine = false, int level = 0)
-        {
-            if (newLine)
-            {
-                CreateSpace();
-            }
+            var offset = 0;
             var hasLabel = !string.IsNullOrEmpty(label);
             if (hasLabel)
             {
-                Console.ForegroundColor = ConsoleColor.White;
                 if (level > 0)
                 {
-                    Console.Write($"  - {label}");
+                    label = string.Join("", Enumerable.Repeat("  ", level)) + $"- {label}";
                 }
-                else
-                {
-                    Console.Write($" {label}");
-                }
-                Console.ResetColor();
+                offset = Math.Max(20, label!.Length + 1);
+                Write(label, ConsoleColor.White);
             }
 
             if (!string.IsNullOrWhiteSpace(value))
             {
                 if (hasLabel)
                 {
-                    Console.Write(":");
+                    Write(":");
                 }
-                WriteMultiline(hasLabel ? 20 : 0, value);
+                WriteMultiline(offset, value);
             }
             else
             {
@@ -117,7 +154,7 @@ namespace PKISharp.WACS.Services
                 {
                     Console.SetCursorPosition(15, Console.CursorTop);
                 }
-                Console.WriteLine($"-----------------------------------------------------------------");
+                WriteLine($"-----------------------------------------------------------------");
             }
 
             _dirty = true;
@@ -126,37 +163,53 @@ namespace PKISharp.WACS.Services
         private void WriteMultiline(int startPos, string value)
         {
             var step = 79 - startPos;
-            var pos = 0;
-            var words = value.Split(' ');
-            while (pos < words.Length)
+            var sentences = value.Split('\n');
+            foreach (var sentence in sentences)
             {
-                var line = "";
-                if (words[pos].Length + 1 >= step)
+                var pos = 0;
+                var words = sentence.Split(' ');
+                while (pos < words.Length)
                 {
-                    line = words[pos++];
-                }
-                else
-                {
-                    while (pos < words.Length && line.Length + words[pos].Length + 1 < step)
+                    var line = "";
+                    if (words[pos].Length + 1 >= step)
                     {
-                        line += " " + words[pos++];
+                        line = words[pos++];
                     }
+                    else
+                    {
+                        while (pos < words.Length && line.Length + words[pos].Length + 1 < step)
+                        {
+                            line += words[pos++] + " ";
+                        }
+                    }
+                    if (!Console.IsOutputRedirected)
+                    {
+                        Console.SetCursorPosition(startPos, Console.CursorTop);
+                    }
+                    WriteLine($" {line.TrimEnd()}");
                 }
-                if (!Console.IsOutputRedirected)
-                {
-                    Console.SetCursorPosition(startPos, Console.CursorTop);
-                }
-                Console.WriteLine($" {line}");
             }
         }
 
-        public Task<string> RequestString(string what)
+        public async Task<int?> RequestInt(string what)
+        {
+            var str = await RequestString(what);
+            if (int.TryParse(str, out var ret))
+            {
+                return ret;
+            }
+            else
+            {
+                _log.Warning("Invalid number: {ret}", str);
+                return null;
+            }
+        }
+
+        public Task<string> RequestString(string what, bool multiline = false)
         {
             Validate(what);
             CreateSpace();
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write($" {what}: ");
-            Console.ResetColor();
+            Write($" {what}: ", ConsoleColor.Green);
 
             // Copied from http://stackoverflow.com/a/16638000
             var bufferSize = 16384;
@@ -171,20 +224,32 @@ namespace PKISharp.WACS.Services
                 left = Console.CursorLeft;
             }
 
-            var answer = Console.ReadLine();
+            var ret = new StringBuilder();
+            do
+            {
+                var line = Console.ReadLine();
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    break;
+                }
+                ret.AppendLine(line);
+            }
+            while (multiline);
+
+            var answer = ret.ToString();
             if (string.IsNullOrWhiteSpace(answer))
             {
                 if (!Console.IsOutputRedirected)
                 {
                     Console.SetCursorPosition(left, top);
                 }
-                Console.WriteLine("<Enter>");
-                Console.WriteLine();
+                WriteLine("<Enter>");
+                WriteLine();
                 return Task.FromResult(string.Empty);
             }
             else
             {
-                Console.WriteLine();
+                WriteLine();
                 return Task.FromResult(answer.Trim());
             }
         }
@@ -193,48 +258,46 @@ namespace PKISharp.WACS.Services
         {
             Validate(message);
             CreateSpace();
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write($" {message} ");
-            Console.ForegroundColor = ConsoleColor.Yellow;
+            Write($" {message} ", ConsoleColor.Green);
             if (defaultChoice)
             {
-                Console.Write($"(y*/n) ");
+                Write($"(y*/n) ", ConsoleColor.Yellow);
             }
             else
             {
-                Console.Write($"(y/n*) ");
+                Write($"(y/n*) ", ConsoleColor.Yellow);
             }
-            Console.ResetColor();
             while (true)
             {
                 var response = Console.ReadKey(true);
                 switch (response.Key)
                 {
-                    case ConsoleKey.Y:
-                        Console.WriteLine(" - yes");
-                        Console.WriteLine();
-                        return Task.FromResult(true);
-                    case ConsoleKey.N:
-                        Console.WriteLine(" - no");
-                        Console.WriteLine();
-                        return Task.FromResult(false);
                     case ConsoleKey.Enter:
-                        Console.WriteLine($" - <Enter>");
-                        Console.WriteLine();
+                        WriteLine($"- <Enter>");
+                        WriteLine();
                         return Task.FromResult(defaultChoice);
+                }
+                switch (response.KeyChar.ToString().ToLower())
+                {
+                    case "y":
+                        WriteLine("- yes");
+                        WriteLine();
+                        return Task.FromResult(true);
+                    case "n":
+                        WriteLine("- no");
+                        WriteLine();
+                        return Task.FromResult(false);
                 }
             }
         }
 
         // Replaces the characters of the typed in password with asterisks
         // More info: http://rajeshbailwal.blogspot.com/2012/03/password-in-c-console-application.html
-        public async Task<string?> ReadPassword(string what)
+        public Task<string?> ReadPassword(string what)
         {
             Validate(what);
             CreateSpace();
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.Write($" {what}: ");
-            Console.ResetColor();
+            Write($" {what}: ", ConsoleColor.Green);
             var password = new StringBuilder();
             try
             {
@@ -243,7 +306,7 @@ namespace PKISharp.WACS.Services
                 {
                     if (info.Key != ConsoleKey.Backspace)
                     {
-                        Console.Write("*");
+                        Write("*");
                         password.Append(info.KeyChar);
                     }
                     else if (info.Key == ConsoleKey.Backspace)
@@ -257,7 +320,7 @@ namespace PKISharp.WACS.Services
                             // move the cursor to the left by one character
                             Console.SetCursorPosition(pos - 1, Console.CursorTop);
                             // replace it with space
-                            Console.Write(" ");
+                            Write(" ");
                             // move the cursor to the left by one character again
                             Console.SetCursorPosition(pos - 1, Console.CursorTop);
                         }
@@ -265,9 +328,9 @@ namespace PKISharp.WACS.Services
                     info = Console.ReadKey(true);
                 }
                 // add a new line because user pressed enter at the end of their password
-                Console.WriteLine();
-                // add another new line to keep a clean break with following log messages
-                Console.WriteLine();
+                WriteLine();
+                _dirty = true;
+                _log.Dirty = true;
             }
             catch (Exception ex)
             {
@@ -278,15 +341,25 @@ namespace PKISharp.WACS.Services
             var ret = password.ToString();
             if (string.IsNullOrEmpty(ret))
             {
-                return null;
+                return Task.FromResult<string?>(default);
             }
             else
             {
-                return ret;
+                return Task.FromResult<string?>(ret);
             }
         }
 
-        public async Task<TResult?> ChooseFromList<TSource, TResult>(
+        /// <summary>
+        /// Version of the picker where null may be returned
+        /// </summary>
+        /// <typeparam name="TSource"></typeparam>
+        /// <typeparam name="TResult"></typeparam>
+        /// <param name="what"></param>
+        /// <param name="options"></param>
+        /// <param name="creator"></param>
+        /// <param name="nullLabel"></param>
+        /// <returns></returns>
+        public async Task<TResult?> ChooseOptional<TSource, TResult>(
             string what, IEnumerable<TSource> options,
             Func<TSource, Choice<TResult?>> creator,
             string nullLabel) where TResult : class
@@ -299,20 +372,20 @@ namespace PKISharp.WACS.Services
             }
             var defaults = baseChoices.Where(x => x.Default);
             var cancel = Choice.Create(default(TResult), nullLabel, _cancelCommand);
-            if (defaults.Count() == 0)
+            if (!defaults.Any())
             {
                 cancel.Command = "<Enter>";
                 cancel.Default = true;
             }
             baseChoices.Add(cancel);
-            return await ChooseFromList(what, baseChoices);
+            return await ChooseFromMenu(what, baseChoices);
         }
 
         /// <summary>
         /// Print a (paged) list of targets for the user to choose from
         /// </summary>
         /// <param name="targets"></param>
-        public async Task<T> ChooseFromList<S, T>(
+        public async Task<T> ChooseRequired<S, T>(
             string what, 
             IEnumerable<S> options, 
             Func<S, Choice<T>> creator) 
@@ -322,14 +395,14 @@ namespace PKISharp.WACS.Services
             {
                 throw new Exception("No options available for required choice");
             }
-            return await ChooseFromList(what, baseChoices);
+            return await ChooseFromMenu(what, baseChoices);
         }
 
         /// <summary>
-        /// Print a (paged) list of targets for the user to choose from
+        /// Print a (paged) list of choices for the user to choose from
         /// </summary>
         /// <param name="choices"></param>
-        public async Task<T> ChooseFromList<T>(string what, List<Choice<T>> choices)
+        public async Task<T> ChooseFromMenu<T>(string what, List<Choice<T>> choices, Func<string, Choice<T>>? unexpected = null)
         {
             if (!choices.Any())
             {
@@ -343,6 +416,14 @@ namespace PKISharp.WACS.Services
             else if (defaults.Count() == 1 && defaults.First().Disabled)
             {
                 throw new Exception("Default option is disabled");
+            }
+            var duplicates = choices.
+                Where(c => c.Command != null).
+                GroupBy(c => c.Command).
+                Where(g => g.Count() > 1);
+            if (duplicates.Any())
+            {
+                throw new Exception($"Duplicate command: {duplicates.First().Key}");
             }
 
             await WritePagedList(choices);
@@ -363,10 +444,20 @@ namespace PKISharp.WACS.Services
                         Where(t => string.Equals(t.Command, choice, StringComparison.InvariantCultureIgnoreCase)).
                         FirstOrDefault();
 
+                    selected ??= choices.
+                            Where(t => string.Equals(t.Description, choice, StringComparison.InvariantCultureIgnoreCase)).
+                            FirstOrDefault();
+
                     if (selected != null && selected.Disabled)
                     {
-                        _log.Warning("The option you have chosen is currently disabled. Run as Administator to enable all features.");
+                        var disabledReason = selected.DisabledReason ?? "Run as Administator to enable all features.";
+                        _log.Warning($"The option you have chosen is currently disabled. {disabledReason}");
                         selected = null;
+                    }
+
+                    if (selected == null && unexpected != null)
+                    {
+                        selected = unexpected(choice);
                     }
                 }
             } while (selected == null);
@@ -382,10 +473,10 @@ namespace PKISharp.WACS.Services
             var currentIndex = 0;
             var currentPage = 0;
             CreateSpace();
-            if (listItems.Count() == 0)
+            if (!listItems.Any())
             {
-                Console.WriteLine($" [empty] ");
-                Console.WriteLine();
+                WriteLine($" [empty] ");
+                WriteLine();
                 return;
             }
 
@@ -394,7 +485,7 @@ namespace PKISharp.WACS.Services
                 // Paging
                 if (currentIndex > 0)
                 {
-                    if (await Wait())
+                    if (await Continue())
                     {
                         currentPage += 1;
                     }
@@ -408,40 +499,28 @@ namespace PKISharp.WACS.Services
                     Take(_settings.UI.PageSize);
                 foreach (var target in page)
                 {
-                    if (target.Command == null)
-                    {
-                        target.Command = (currentIndex + 1).ToString();
-                    }
+                    target.Command ??= (currentIndex + 1).ToString();
 
                     if (!string.IsNullOrEmpty(target.Command))
                     {
-                        Console.ForegroundColor = target.Default ? 
-                            ConsoleColor.Green : 
+                        Write($" {target.Command}: ", target.Default ?
+                            ConsoleColor.Green :
                             target.Disabled ?
-                                ConsoleColor.DarkGray : 
-                                ConsoleColor.White;
-                        Console.Write($" {target.Command}: ");
-                        Console.ResetColor();
+                                ConsoleColor.DarkGray :
+                                ConsoleColor.White);
                     }
                     else
                     {
-                        Console.Write($" * ");
+                        Write($" * ");
                     }
 
-                    if (target.Disabled)
-                    {
-                        Console.ForegroundColor = ConsoleColor.DarkGray;
-                    } 
-                    else if (target.Color.HasValue)
-                    {
-                        Console.ForegroundColor = target.Color.Value;
-                    }
-                    Console.WriteLine(target.Description);
-                    Console.ResetColor();
+                    WriteLine(target.Description, 
+                        target.Disabled ? ConsoleColor.DarkGray : 
+                        target.Color.HasValue ? target.Color.Value : null);
                     currentIndex++;
                 }
             }
-            Console.WriteLine();
+            WriteLine();
         }
 
         public string FormatDate(DateTime date) => date.ToString(_settings.UI.DateFormat);

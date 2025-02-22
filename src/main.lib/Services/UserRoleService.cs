@@ -1,49 +1,41 @@
 ﻿using PKISharp.WACS.Clients.IIS;
-using System;
-using System.Security.Principal;
+using PKISharp.WACS.Plugins.Interfaces;
 
 namespace PKISharp.WACS.Services
 {
-    internal class UserRoleService
+    internal class UserRoleService : IUserRoleService
     {
         private readonly IIISClient _iisClient;
+        private readonly AdminService _adminService;
 
-        public UserRoleService(IIISClient iisClient) => _iisClient = iisClient;
-
-        public bool AllowTaskScheduler => IsAdmin;
-        public bool AllowCertificateStore => IsAdmin;
-        public bool AllowIIS => IsAdmin && _iisClient.Version.Major > 6;
-        public bool IsAdmin => IsAdminLazy.Value;
-
-        private Lazy<bool> IsAdminLazy => new Lazy<bool>(DetermineAdmin);
-
-        private bool DetermineAdmin()
+        public UserRoleService(IIISClient iisClient, AdminService adminService)
         {
-            bool isAdmin;
-            WindowsIdentity? user = null;
-            try
+            _iisClient = iisClient;
+            _adminService = adminService;
+        }
+
+        public bool AllowTaskScheduler => _adminService.IsAdmin;
+
+        public bool AllowCertificateStore => _adminService.IsAdmin;
+
+        public bool AllowLegacy => _adminService.IsAdmin;
+
+        public bool AllowSelfHosting => _adminService.IsAdmin;
+
+        public State IISState
+        {
+            get
             {
-                //get the currently logged in user
-                user = WindowsIdentity.GetCurrent();
-                var principal = new WindowsPrincipal(user);
-                isAdmin = principal.IsInRole(WindowsBuiltInRole.Administrator);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                isAdmin = false;
-            }
-            catch (Exception)
-            {
-                isAdmin = false;
-            }
-            finally
-            {
-                if (user != null)
+                if (!_adminService.IsAdmin)
                 {
-                    user.Dispose();
+                    return State.DisabledState("Run as administrator to allow access to IIS.");
                 }
+                if (_iisClient.Version.Major <= 6)
+                {
+                    return State.DisabledState("No supported version of IIS detected.");
+                }
+                return State.EnabledState();
             }
-            return isAdmin;
         }
     }
 }

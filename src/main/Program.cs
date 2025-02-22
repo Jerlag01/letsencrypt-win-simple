@@ -1,111 +1,115 @@
 ﻿using Autofac;
-using PKISharp.WACS.Acme;
-using PKISharp.WACS.Clients;
-using PKISharp.WACS.Clients.DNS;
-using PKISharp.WACS.Clients.IIS;
-using PKISharp.WACS.Configuration;
-using PKISharp.WACS.Plugins.Resolvers;
-using PKISharp.WACS.Plugins.TargetPlugins;
 using PKISharp.WACS.Services;
 using System;
-using System.Diagnostics;
 using System.Linq;
-using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Host
 {
+    /// <summary>
+    /// This class serves as bootstrapper to call the main library
+    /// </summary>
     internal class Program
     {
-        private static void Main(string[] args)
+        /// <summary>
+        /// Prevent starting program twice at the same time
+        /// </summary>
+        private static Mutex? _globalMutex;
+
+        private async static Task Main(string[] args)
         {
-            // Setup DI
-            var container = GlobalScope(args);
-            if (container == null)
+            // Error handling
+            AppDomain.CurrentDomain.UnhandledException += 
+                new UnhandledExceptionEventHandler(OnUnhandledException);
+
+            // Are we running in verbose mode?
+            var verbose = args.Contains("--verbose") || args.Contains("/verbose");
+
+            // The main class might change the character encoding
+            // save the original setting so that it can be restored
+            // after the run.
+            var originalOut = Console.OutputEncoding;
+            var originalIn = Console.InputEncoding;
+            try
             {
-                return;
+                // Setup IOC container
+                var container = Autofac.Container(args, verbose);
+                AllowInstanceToRun(container);
+                var wacs = container.Resolve<Wacs>();
+                Environment.ExitCode = await wacs.Start().ConfigureAwait(false);
+            } 
+            catch (Exception ex)
+            {
+                Console.WriteLine(" Error in main function: " + ex.Message);
+                if (verbose)
+                {
+                    Console.WriteLine(ex.StackTrace);
+                    while (ex.InnerException != null) {
+                        ex = ex.InnerException;
+                        Console.WriteLine(ex.Message);
+                        Console.WriteLine(ex.StackTrace);
+                    }
+                }
+                FriendlyClose();
+            } 
+            finally
+            {
+                // Restore original code page
+                Console.OutputEncoding = originalOut;
+                Console.InputEncoding = originalIn;
+                _globalMutex?.Dispose();
             }
-
-            // Default is Tls 1.0 only, change to Tls 1.2 or 1.3
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
-            AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(MyHandler);
-
-            // Uncomment the follow line to test with Fiddler
-            // System.Net.ServicePointManager.ServerCertificateValidationCallback += (sender, cert, chain, sslPolicyErrors) => true;
-
-            // Enable international character rendering
-            var original = Console.OutputEncoding;
-
-            // Load main instance
-            new Wacs(container).Start().Wait();
-
-            // Restore original code page
-            Console.OutputEncoding = original;
         }
-        static void MyHandler(object sender, UnhandledExceptionEventArgs args)
+
+        /// <summary>
+        /// Block multiple instances from running at the same time
+        /// on the same configuration path, because they might 
+        /// overwrite eachothers stuff
+        /// </summary>
+        /// <returns></returns>
+        static void AllowInstanceToRun(ILifetimeScope container)
         {
-            var e = (Exception)args.ExceptionObject;
-            Console.WriteLine("MyHandler caught : " + e.Message);
-            Console.WriteLine("Runtime terminating: {0}", args.IsTerminating);
+            var logger = container.Resolve<ILogService>();
+            _globalMutex = new Mutex(true, "wacs.exe", out var created);
+            if (!created)
+            {
+                logger.Warning("Another instance of wacs.exe is already running, waiting for that to close...");
+                try
+                {
+                    _ = _globalMutex.WaitOne();
+                } 
+                catch (AbandonedMutexException)
+                {
+                    return;
+                }
+            }
         }
 
-        internal static IContainer GlobalScope(string[] args)
+        /// <summary>
+        /// Close in a friendly way
+        /// </summary>
+        static void FriendlyClose()
         {
-            var builder = new ContainerBuilder();
-            var logger = new LogService();
-            if (args.Contains("--verbose"))
+            _globalMutex?.ReleaseMutex();
+            Environment.ExitCode = -1;
+            if (Environment.UserInteractive)
             {
-                logger.SetVerbose();
+                Console.WriteLine(" Press <Enter> to close");
+                _ = Console.ReadLine();
             }
-            var pluginService = new PluginService(logger);
-            var argumentsParser = new ArgumentsParser(logger, pluginService, args);
-            var argumentsService = new ArgumentsService(logger, argumentsParser);
-            if (!argumentsService.Valid)
-            {
-                Environment.ExitCode = -1;
-                return null;
-            }
-            var settingsService = new SettingsService(logger, argumentsService);
-            if (!settingsService.Valid)
-            {
-                Environment.ExitCode = -1;
-                return null;
-            }
-            logger.SetDiskLoggingPath(settingsService.Client.LogPath);
+        }
 
-            _ = builder.RegisterInstance(argumentsService);
-            _ = builder.RegisterInstance(argumentsParser);
-            _ = builder.RegisterInstance(logger).As<ILogService>();
-            _ = builder.RegisterInstance(settingsService).As<ISettingsService>();
-            _ = builder.RegisterInstance(argumentsService).As<IArgumentsService>();
-            _ = builder.RegisterInstance(pluginService).As<IPluginService>();
-            _ = builder.RegisterType<UserRoleService>().SingleInstance();
-            _ = builder.RegisterType<InputService>().As<IInputService>().SingleInstance();
-            _ = builder.RegisterType<ProxyService>().SingleInstance();
-            _ = builder.RegisterType<PasswordGenerator>().SingleInstance();
-            _ = builder.RegisterType<RenewalService>().As<IRenewalStore>().SingleInstance();
-
-            pluginService.Configure(builder);
-
-            _ = builder.RegisterType<DomainParseService>().SingleInstance();
-            _ = builder.RegisterType<IISClient>().As<IIISClient>().SingleInstance();
-            _ = builder.RegisterType<IISHelper>().SingleInstance();
-            _ = builder.RegisterType<ExceptionHandler>().SingleInstance();
-            _ = builder.RegisterType<UnattendedResolver>();
-            _ = builder.RegisterType<InteractiveResolver>();
-            _ = builder.RegisterType<AutofacBuilder>().As<IAutofacBuilder>().SingleInstance();
-            _ = builder.RegisterType<AcmeClient>().SingleInstance();
-            _ = builder.RegisterType<PemService>().SingleInstance();
-            _ = builder.RegisterType<EmailClient>().SingleInstance();
-            _ = builder.RegisterType<ScriptClient>().SingleInstance();
-            _ = builder.RegisterType<LookupClientProvider>().SingleInstance();
-            _ = builder.RegisterType<CertificateService>().As<ICertificateService>().SingleInstance();
-            _ = builder.RegisterType<TaskSchedulerService>().SingleInstance();
-            _ = builder.RegisterType<NotificationService>().SingleInstance();
-            _ = builder.RegisterType<RenewalExecutor>().SingleInstance();
-            _ = builder.RegisterType<RenewalManager>().SingleInstance();
-            _ = builder.Register(c => c.Resolve<IArgumentsService>().MainArguments).SingleInstance();
-
-            return builder.Build();
+        /// <summary>
+        /// Final resort to catch unhandled exceptions and log something
+        /// before the runtime explodes.
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="args"></param>
+        static void OnUnhandledException(object sender, UnhandledExceptionEventArgs args)
+        {
+            var ex = (Exception)args.ExceptionObject;
+            Console.WriteLine(" Unhandled exception caught: " + ex.Message);
         }
     }
 }

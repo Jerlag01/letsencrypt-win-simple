@@ -1,4 +1,4 @@
-﻿using PKISharp.WACS.Configuration;
+﻿using PKISharp.WACS.Configuration.Arguments;
 
 namespace PKISharp.WACS.Extensions
 {
@@ -11,6 +11,7 @@ namespace PKISharp.WACS.Extensions
         public static void Clear(this MainArguments options)
         {
             options.Target = null;
+            options.Source = null;
             options.Renew = false;
             options.FriendlyName = null;
             options.Force = false;

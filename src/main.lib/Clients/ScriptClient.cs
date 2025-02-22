@@ -18,7 +18,7 @@ namespace PKISharp.WACS.Clients
         }
 
 
-        public async Task RunScript(string script, string parameters)
+        public async Task<bool> RunScript(string script, string parameters, string? censoredParameters = null)
         {
             if (!string.IsNullOrWhiteSpace(script))
             {
@@ -26,8 +26,8 @@ namespace PKISharp.WACS.Clients
                 var actualParameters = parameters;
                 if (actualScript.EndsWith(".ps1"))
                 {
-                    actualScript = "powershell.exe";
-                    actualParameters = $"-executionpolicy bypass &'{script}' {parameters.Replace("\"", "\"\"\"")}";
+                    actualScript = _settings.Script.PowershellExecutablePath ?? "powershell.exe";
+                    actualParameters = $"-windowstyle hidden -noninteractive -executionpolicy bypass -command \"&{{&'{script.Replace("'", "''")}' {parameters.Replace("\"", "\"\"\"")}; exit $LastExitCode}}\"";
                 }
                 var PSI = new ProcessStartInfo(actualScript)
                 {
@@ -41,7 +41,7 @@ namespace PKISharp.WACS.Clients
                 };
                 if (!string.IsNullOrWhiteSpace(actualParameters))
                 {
-                    _log.Information(LogType.All, "Script {script} starting with parameters {parameters}", script, parameters);
+                    _log.Information(LogType.All, "Script {script} starting with parameters {parameters}", script, censoredParameters ?? parameters);
                     PSI.Arguments = actualParameters;
                 }
                 else
@@ -80,7 +80,7 @@ namespace PKISharp.WACS.Clients
                     process.EnableRaisingEvents = true;
                     process.Exited += (s, e) =>
                     {
-                        _log.Information(LogType.Event, output.ToString());
+                        _log.Information(LogType.Event | LogType.Disk | LogType.Notification, output.ToString());
                         exited = true;
                         if (process.ExitCode != 0)
                         {
@@ -102,6 +102,7 @@ namespace PKISharp.WACS.Clients
 
                     process.BeginErrorReadLine();
                     process.BeginOutputReadLine();
+                    process.StandardInput.Close(); // Helps end the process
                     var totalWait = 0;
                     var interval = 2000;
                     while (!exited && totalWait < _settings.Script.Timeout * 1000)
@@ -121,16 +122,23 @@ namespace PKISharp.WACS.Clients
                         {
                             _log.Error(ex, "Killing process {Id} failed", process.Id);
                         }
+                        return false;
+                    } 
+                    else
+                    {
+                        return process.ExitCode == 0;
                     }
                 }
                 catch (Exception ex)
                 {
                     _log.Error(ex, "Script is unable to start");
+                    return false;
                 }
             }
             else
             {
                 _log.Warning("No script configured.");
+                return false;
             }
         }
     }

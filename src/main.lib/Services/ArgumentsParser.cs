@@ -1,6 +1,8 @@
-﻿using PKISharp.WACS.Services;
+﻿using PKISharp.WACS.Configuration.Arguments;
+using PKISharp.WACS.Services;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 
 namespace PKISharp.WACS.Configuration
@@ -9,9 +11,49 @@ namespace PKISharp.WACS.Configuration
     {
         private readonly ILogService _log;
         private readonly string[] _args;
-        private readonly List<IArgumentsProvider> _providers;
+        private readonly IEnumerable<IArgumentsProvider> _providers;
+        private readonly IEnumerable<CommandLineAttribute> _arguments;
 
-        public T GetArguments<T>() where T : class, new()
+        public ArgumentsParser(ILogService log, AssemblyService assemblyService, string[] args)
+        {
+            _log = log;
+            _args = args;
+            _providers = ArgumentsProviders(assemblyService);
+            _arguments = _providers.SelectMany(x => x.Configuration).ToList();
+        }
+
+        public IEnumerable<IArgumentsProvider> ArgumentsProviders(AssemblyService assemblyService)
+        {
+            var argumentGroups = assemblyService.GetResolvable<IArguments>();
+            return argumentGroups.Select(x =>
+                {
+                    var type = typeof(BaseArgumentsProvider<>).MakeGenericType(x.Type);
+                    var constr = type.GetConstructor(Array.Empty<Type>());
+                    if (constr == null)
+                    {
+                        throw new Exception("IArgumentsProvider should have parameterless constructor");
+                    }
+                    try
+                    {
+                        var ret = (IArgumentsProvider)constr.Invoke(Array.Empty<object>());
+                        ret.Log = _log;
+                        return ret;
+                    }
+                    catch (Exception ex)
+                    {
+                        if (ex.InnerException != null)
+                        {
+                            ex = ex.InnerException;
+                        }
+                        _log.Error(ex, ex.Message);
+                        return null;
+                    }
+                }).
+                OfType<IArgumentsProvider>().
+                ToList();
+        }
+
+        public T? GetArguments<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicConstructors)] T>() where T : class, new()
         {
             foreach (var provider in _providers)
             {
@@ -23,24 +65,19 @@ namespace PKISharp.WACS.Configuration
             throw new InvalidOperationException($"Unable to find class that implements IArgumentsProvider<{typeof(T).Name}>");
         }
 
-        public ArgumentsParser(ILogService log, IPluginService plugins, string[] args)
-        {
-            _log = log;
-            _args = args;
-            _providers = plugins.OptionProviders();
-        }
-
+        /// <summary>
+        /// Test if the arguments can be resolved by any of the known providers
+        /// </summary>
+        /// <returns></returns>
         internal bool Validate()
         {
-            // Test if the arguments can be resolved by any of the known providers
-            var superset = _providers.SelectMany(x => x.Configuration);
-            var result = _providers.First().GetParseResult(_args);
-            foreach (var add in result.AdditionalOptionsFound)
+            var extraOptions = _providers.First().GetExtraArguments(_args);
+            foreach (var extraOption in extraOptions)
             {
-                var super = superset.FirstOrDefault(x => string.Equals(x.LongName, add.Key, StringComparison.CurrentCultureIgnoreCase));
+                var super = _arguments.FirstOrDefault(x => string.Equals(x.Name, extraOption, StringComparison.InvariantCultureIgnoreCase));
                 if (super == null)
                 {
-                    _log.Error("Unknown argument --{0}", add.Key);
+                    _log.Error("Unknown argument --{0}, use --help to get a list of possible arguments", extraOption);
                     return false;
                 }
             }
@@ -52,14 +89,18 @@ namespace PKISharp.WACS.Configuration
                 return false;
             }
             var mainProvider = _providers.OfType<IArgumentsProvider<MainArguments>>().First();
-            if (mainProvider.Validate(_log, main, main))
+            if (mainProvider.Validate(main, main, _args))
             {
                 // Validate the others
                 var others = _providers.Except(new[] { mainProvider });
                 foreach (var other in others)
                 {
                     var opt = other.GetResult(_args);
-                    if (!other.Validate(_log, opt, main))
+                    if (opt == null)
+                    {
+                        return false;
+                    }
+                    if (!other.Validate(opt, main, _args))
                     {
                         return false;
                     }
@@ -84,7 +125,7 @@ namespace PKISharp.WACS.Configuration
             foreach (var other in others)
             {
                 var opt = other.GetResult(_args);
-                if (other.Active(opt))
+                if (opt != null && other.Active(opt, _args))
                 {
                     return true;
                 }
@@ -93,9 +134,47 @@ namespace PKISharp.WACS.Configuration
         }
 
         /// <summary>
+        /// Get list of secret arguments that should be censored in the logs
+        /// </summary>
+        internal IEnumerable<string> SecretArguments => _arguments.Where(x => x.Secret).Select(x => x.ArgumentName);
+
+        /// <summary>
         /// Show current command line
         /// </summary>
-        internal void ShowCommandLine() => _log.Verbose($"Arguments: {string.Join(" ", _args)}");
+        internal void ShowCommandLine()
+        {
+            try
+            {
+                var censoredArgs = new List<string>();
+                var censor = false;
+                for (var i = 0; i < _args.Length; i++)
+                {
+                    if (!censor)
+                    {
+                        var value = _args[i];
+                        value = value.Replace("\"", "\\\"");
+                        if (value.Contains(' '))
+                        {
+                            value = $"\"{value}\"";
+                        }
+                        censoredArgs.Add(value);
+                        censor = SecretArguments.Any(c => _args[i].ToLower() == $"--{c}" || _args[i].ToLower() == $"/{c}");
+                    }
+                    else
+                    {
+                        censoredArgs.Add("********");
+                        censor = false;
+                    }
+                }
+                var argsFormat = censoredArgs.Any() ? $"Arguments: {string.Join(" ", censoredArgs)}" : "No command line arguments provided";
+                _log.Verbose(LogType.Screen | LogType.Event, argsFormat);
+                _log.Information(LogType.Disk, argsFormat);
+            }
+            catch (Exception ex)
+            {
+                _log.Warning("Error censoring command line: {ex}", ex.Message);
+            }
+        }
 
         /// <summary>
         /// Show command line arguments for the help function
@@ -129,19 +208,19 @@ namespace PKISharp.WACS.Configuration
                         }
                     }
                     Console.WriteLine("```");
-                    foreach (var x in provider.Configuration)
+                    foreach (var x in provider.Configuration.Where(x => !x.Obsolete))
                     {
                         Console.ForegroundColor = ConsoleColor.White;
-                        Console.Write($"   --{x.LongName}");
+                        Console.Write($"   --{x.ArgumentName}");
                         Console.WriteLine();
                         Console.ResetColor();
                         var step = 60;
                         var pos = 0;
-                        var words = x.Description.Split(' ');
+                        var words = x.Description?.Split(' ') ?? Array.Empty<string>();
                         while (pos < words.Length)
                         {
                             var line = "";
-                            while (pos < words.Length && line.Length + words[pos].Length + 1 < step)
+                            while (line == "" || (pos < words.Length && line.Length + words[pos].Length + 1 < step))
                             {
                                 line += " " + words[pos++];
                             }

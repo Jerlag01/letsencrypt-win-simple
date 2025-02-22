@@ -1,65 +1,77 @@
-﻿using PKISharp.WACS.Extensions;
+﻿using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Extensions;
 using PKISharp.WACS.Plugins.Base.Factories;
 using PKISharp.WACS.Services;
-using System;
+using PKISharp.WACS.Services.Serialization;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Plugins.StorePlugins
 {
-    internal class PemFilesOptionsFactory : StorePluginOptionsFactory<PemFiles, PemFilesOptions>
+    internal class PemFilesOptionsFactory : PluginOptionsFactory<PemFilesOptions>
     {
         private readonly ILogService _log;
-        private readonly IArgumentsService _arguments;
+        private readonly ArgumentsInputService _arguments;
         private readonly ISettingsService _settings;
 
-        public PemFilesOptionsFactory(ILogService log, ISettingsService settings, IArgumentsService arguments)
+        public PemFilesOptionsFactory(
+            ILogService log, 
+            ISettingsService settings,
+            ArgumentsInputService arguments)
         {
             _log = log;
             _arguments = arguments;
             _settings = settings;
         }
 
+        private ArgumentResult<ProtectedString?> Password => _arguments.
+            GetProtectedString<PemFilesArguments>(args => args.PemPassword, true).
+            WithDefault(_settings.Store.PemFiles.DefaultPassword.Protect(true)).
+            DefaultAsNull();
+
+        private ArgumentResult<string?> Path => _arguments.
+            GetString<PemFilesArguments>(args => args.PemFilesPath).
+            WithDefault(_settings.Store.PemFiles.DefaultPath).
+            Required().
+            Validate(x => Task.FromResult(x.ValidPath(_log)), "invalid path").
+            DefaultAsNull();
+
+        private ArgumentResult<string?> Name => _arguments.
+            GetString<PemFilesArguments>(args => args.PemFilesName);
+
         public override async Task<PemFilesOptions?> Aquire(IInputService input, RunLevel runLevel)
         {
-            var args = _arguments.GetArguments<PemFilesArguments>();
-            var path = args.PemFilesPath;
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                path = _settings.Store.DefaultPemFilesPath;
-            }
-            while (string.IsNullOrWhiteSpace(path) || !path.ValidPath(_log))
-            {
-                path = await input.RequestString("Path to folder where .pem files are stored");
-            }
-            return Create(path);
+            var path = await Path.Interactive(input, "File path").GetValue();
+            var name = await Name.GetValue();
+            var password = await Password.Interactive(input).GetValue();
+            return Create(path, name, password);
         }
 
         public override async Task<PemFilesOptions?> Default()
         {
-            var args = _arguments.GetArguments<PemFilesArguments>();
-            var path = _settings.Store.DefaultPemFilesPath;
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                path = _arguments.TryGetRequiredArgument(nameof(args.PemFilesPath), args.PemFilesPath);
-            }
-            if (path.ValidPath(_log))
-            {
-                return Create(path);
-            }
-            else
-            {
-                throw new Exception("Invalid path specified");
-            }
+            var path = await Path.GetValue();
+            var name = await Name.GetValue();
+            var password = await Password.GetValue();
+            return Create(path, name, password);
         }
 
-        private PemFilesOptions Create(string path)
+        private static PemFilesOptions Create(
+            string? path, 
+            string? name,
+            ProtectedString? password)
         {
-            var ret = new PemFilesOptions();
-            if (!string.Equals(path, _settings.Store.DefaultPemFilesPath, StringComparison.CurrentCultureIgnoreCase))
+            return new PemFilesOptions
             {
-                ret.Path = path;
-            }
-            return ret;
+                PemPassword = password,
+                Path = path,
+                FileName = name
+            };
+        }
+
+        public override IEnumerable<(CommandLineAttribute, object?)> Describe(PemFilesOptions options)
+        {
+            yield return (Path.Meta, options.Path);
+            yield return (Password.Meta, options.PemPassword);
         }
     }
 

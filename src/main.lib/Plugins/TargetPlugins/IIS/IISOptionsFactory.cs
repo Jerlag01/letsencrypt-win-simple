@@ -1,54 +1,57 @@
-﻿using PKISharp.WACS.Clients.IIS;
+﻿using Fclp.Internals.Extensions;
+using PKISharp.WACS.Clients.IIS;
+using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
 using PKISharp.WACS.Extensions;
 using PKISharp.WACS.Plugins.Base.Factories;
 using PKISharp.WACS.Services;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Plugins.TargetPlugins
 {
-    internal class IISOptionsFactory : TargetPluginOptionsFactory<IIS, IISOptions>
+    internal class IISOptionsFactory<TOptions> : PluginOptionsFactory<TOptions>
+        where TOptions : IISOptions, new()
     {
         private readonly IISHelper _iisHelper;
         private readonly ILogService _log;
-        private readonly IArgumentsService _arguments;
+        private readonly MainArguments _args;
+        private readonly ArgumentsInputService _arguments;
 
         public IISOptionsFactory(
             ILogService log,
-            IIISClient iisClient,
             IISHelper iisHelper,
-            IArgumentsService arguments,
-            UserRoleService userRoleService)
+            MainArguments args,
+            ArgumentsInputService arguments)
         {
             _iisHelper = iisHelper;
             _log = log;
             _arguments = arguments;
-            Hidden = !(iisClient.Version.Major > 6);
-            Disabled = IIS.Disabled(userRoleService);
+            _args = args;
         }
-
-        public override int Order => 2;
 
         /// <summary>
-        /// Match with the legacy target plugin names
+        /// Change order in the menu
         /// </summary>
-        /// <param name="name"></param>
-        /// <returns></returns>
-        public override bool Match(string name)
-        {
-            switch (name.ToLowerInvariant())
-            {
-                case "iisbinding":
-                case "iissite":
-                case "iissites":
-                    return true;
-                default:
-                    return base.Match(name);
-            }
-        }
+        public override int Order => 2;
+
+        private ArgumentResult<string?> Host => _arguments.GetString<IISArguments>(x => x.Host);
+        private ArgumentResult<string?> Pattern => _arguments.GetString<IISArguments>(x => x.Pattern);
+        private ArgumentResult<string?> Regex => _arguments.GetString<IISArguments>(x => x.Regex);
+        private ArgumentResult<string?> SiteId => _arguments.GetString<IISArguments>(x => x.SiteId);
+        private ArgumentResult<string?> Type => _arguments.
+            GetString<IISArguments>(x => x.Type).
+            DefaultAsNull().
+            Validate(x => Task.FromResult(x.ParseCsv()?.All(x => x == IISHelper.WebTypeFilter || x == IISHelper.FtpTypeFilter) ?? false), "unsupported value");
+
+        private ArgumentResult<string?> ExcludeBindings => _arguments.GetString<IISArguments>(x => x.ExcludeBindings);
+        private ArgumentResult<string?> CommonName => _arguments.
+            GetString<IISArguments>(x => x.CommonName).
+            Validate(x => Task.FromResult(x?.Length <= Constants.MaxCommonName), $"Common name too long (max {Constants.MaxCommonName} characters)");
 
         /// <summary>
         /// Get settings in interactive mode
@@ -56,21 +59,21 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// <param name="input"></param>
         /// <param name="runLevel"></param>
         /// <returns></returns>
-        public override async Task<IISOptions?> Aquire(IInputService input, RunLevel runLevel)
+        public override async Task<TOptions?> Aquire(IInputService input, RunLevel runLevel)
         {
             var allSites = _iisHelper.GetSites(true).Where(x => x.Hosts.Any()).ToList();
             if (!allSites.Any())
             {
-                _log.Error($"No sites with host bindings have been configured in IIS. " +
+                _log.Error($"No websites with host bindings have been configured in IIS. " +
                     $"Add one in the IIS Manager or choose the plugin '{ManualOptions.DescriptionText}' " +
                     $"instead.");
                 return null;
             }
 
-            var visibleSites = allSites.Where(x => !_arguments.MainArguments.HideHttps || x.Https == false).ToList();
+            var visibleSites = allSites.Where(x => !_args.HideHttps || x.Secure == false).ToList();
             if (!visibleSites.Any())
             {
-                _log.Error("No sites with host bindings remain after applying the --{hidehttps} filter. " +
+                _log.Error("No websites with host name bindings remain after applying the --{hidehttps} filter. " +
                     "It looks like all your websites are already configured for https!", "hidehttps");
                 return null;
             }
@@ -81,8 +84,8 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
                 visibleSites = visibleSites.Where(x => x.Hosts.Any(h => !h.StartsWith("*"))).ToList();
                 if (!visibleSites.Any())
                 {
-                    _log.Error("No sites with host bindings remain after discarding wildcard domains. To " +
-                        "create certificates including wildcards, please use the 'Full options' mode, as " +
+                    _log.Error("No websites with host names remain after discarding wildcard identifiers. To " +
+                        "create certificates including wildcards, please use the 'full options' mode, as " +
                         "this requires DNS validation.");
                     return null;
                 }
@@ -92,17 +95,12 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             do
             {
                 var allBindings = _iisHelper.GetBindings();
-                var visibleBindings = allBindings.Where(x => !_arguments.MainArguments.HideHttps || x.Https == false).ToList();
-                if (!runLevel.HasFlag(RunLevel.Advanced))
-                {
-                    // Hide bindings with wildcards because they cannot be validated in simple mode
-                    visibleBindings = visibleBindings.Where(x => !x.Wildcard).ToList();
-                }
+                var visibleBindings = allBindings.Where(x => !_args.HideHttps || x.Secure == false).ToList();
                 var ret = await TryAquireSettings(input, allBindings, visibleBindings, allSites, visibleSites, runLevel);
                 if (ret != null)
                 {
                     var filtered = _iisHelper.FilterBindings(allBindings, ret);
-                    await ListBindings(input, runLevel, filtered, ret.CommonName);
+                    await ListBindings(input, filtered, ret.CommonName);
                     if (await input.PromptYesNo("Continue with this selection?", true))
                     {
                         return ret;
@@ -126,107 +124,124 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// <param name="visibleSites"></param>
         /// <param name="runLevel"></param>
         /// <returns></returns>
-        private async Task<IISOptions?> TryAquireSettings(
-            IInputService input, 
+        private async Task<TOptions?> TryAquireSettings(
+            IInputService input,
             List<IISHelper.IISBindingOption> allBindings,
             List<IISHelper.IISBindingOption> visibleBindings,
             List<IISHelper.IISSiteOption> allSites,
             List<IISHelper.IISSiteOption> visibleSites,
             RunLevel runLevel)
         {
+            input.CreateSpace();
             input.Show(null, "Please select which website(s) should be scanned for host names. " +
-                "You may input one or more site identifiers (comma separated) to filter by those sites, " +
-                "or alternatively leave the input empty to scan *all* websites.", true);
+                "You may input one or more site identifiers (comma-separated) to filter by those sites, " +
+                "or alternatively leave the input empty to scan *all* websites.");
 
-            var options = new IISOptions();
+            // Include all types by default
+            var options = new TOptions
+            {
+                IncludeTypes = new List<string>() {
+                    IISHelper.FtpTypeFilter,
+                    IISHelper.WebTypeFilter
+                }
+            };
+
+            // Pick sites
             await input.WritePagedList(
                 visibleSites.Select(x => Choice.Create(
                     item: x,
-                    description: $"{x.Name} ({x.Hosts.Count()} binding{(x.Hosts.Count() == 1 ? "" : "s")})",
+                    description: $"{x.Name} ({x.Hosts.Count} binding{(x.Hosts.Count == 1 ? "" : "s")})",
                     command: x.Id.ToString(),
-                    color: x.Https ? ConsoleColor.DarkGray : (ConsoleColor?)null)));
-            var raw = await input.RequestString("Site identifier(s) or <ENTER> to choose all");
+                    color: x.Secure ? ConsoleColor.DarkGray : (ConsoleColor?)null)));
+            var raw = await input.RequestString("Site identifier(s) or <Enter> to choose all");
             if (!ParseSiteOptions(raw, allSites, options))
             {
                 return null;
             }
 
+            // Pick bindings
             var filtered = _iisHelper.FilterBindings(visibleBindings, options);
-            await ListBindings(input, runLevel, filtered);
-            input.Show(null, 
-                "You may either choose to include all listed bindings as host names in your certificate, " +
-                "or apply an additional filter. Different types of filters are available.", true);
+            await ListBindings(input, filtered);
+            input.CreateSpace();
+            input.Show(null,
+                "Listed above are the bindings found on the selected site(s). By default all of " +
+                "them will be included, but you may either pick specific ones by typing the host names " +
+                "or identifiers (comma-separated) or filter them using one of the options from the " +
+                "menu.");
             var askExclude = true;
             var filters = new List<Choice<Func<Task>>>
             {
-                Choice.Create<Func<Task>>(() => {
-                    askExclude = false;
-                    return InputHosts(
-                        "Include bindings", input, allBindings, filtered, options,
-                        () => options.IncludeHosts, x => options.IncludeHosts = x);
-                }, "Pick specific bindings from the list"),
-                Choice.Create<Func<Task>>(() => {
-                    return InputPattern(input, options); 
-                }, "Pick bindings based on a search pattern"),
+                Choice.Create<Func<Task>>(
+                    () => InputPattern(input, options), 
+                    "Pick bindings based on a search pattern", command: "P"),
                 Choice.Create<Func<Task>>(() => { 
                     askExclude = false; 
                     return Task.CompletedTask; 
-                }, "Pick *all* bindings", @default: true)
+                }, "Pick *all* bindings", @default: true, command: "A")
             };
             if (runLevel.HasFlag(RunLevel.Advanced))
             {
-                filters.Insert(2, Choice.Create<Func<Task>>(() => { 
+                filters.Insert(1, Choice.Create<Func<Task>>(() => { 
                     askExclude = true; 
                     return InputRegex(input, options);
-                }, "Pick bindings based on a regular expression"));
+                }, "Pick bindings based on a regular expression", command: "R"));
             }
-            var chosen = await input.ChooseFromList("How do you want to pick the bindings?", filters);
+
+            // Handle undefined input
+            Choice<Func<Task>> processUnkown(string unknown) {
+                return Choice.Create<Func<Task>>(() =>
+                {
+                    askExclude = false;
+                    return Task.FromResult(ProcessInputHosts(
+                        unknown, 
+                        allBindings, 
+                        filtered, 
+                        options,
+                        () => options.IncludeHosts, x => options.IncludeHosts = x));
+                });
+            }
+
+            var chosen = await input.ChooseFromMenu(
+                "Binding identifiers(s) or menu option",
+                filters,
+                processUnkown);
             await chosen.Invoke();
+
             filtered = _iisHelper.FilterBindings(allBindings, options);
 
-            // Check for wildcards in simple mode
-            if (!runLevel.HasFlag(RunLevel.Advanced) && filtered.Any(x => x.Wildcard))
-            {
-                await ListBindings(input, runLevel, filtered);
-                input.Show(null, "The pattern that you've chosen matches a wildcard binding, which " +
-                    "is not supported by the 'simple' mode of this program because it requires DNS " +
-                    "validation. Please try again with a different pattern or use the 'full options' " +
-                    "mode instead.", true);
-                return null;
-            }
-
             // Exclude specific bindings
-            var listForCommon = false;
             if (askExclude && filtered.Count > 1 && runLevel.HasFlag(RunLevel.Advanced))
             {
-                await ListBindings(input, runLevel, filtered);
+                await ListBindings(input, filtered);
+                input.CreateSpace();
                 input.Show(null, "The listed bindings match your current filter settings. " +
                     "If you wish to exclude one or more of them from the certificate, please " +
-                    "input those bindings now. Press <ENTER> to include all listed bindings.", true);
+                    "input those bindings now. Press <Enter> to include all listed bindings.");
                 await InputHosts("Exclude bindings", 
                     input, allBindings, filtered, options, 
                     () => options.ExcludeHosts, x => options.ExcludeHosts = x);
                 if (options.ExcludeHosts != null)
                 {
                     filtered = _iisHelper.FilterBindings(allBindings, options);
-                    listForCommon = true;
                 }
             } 
-            else
-            {
-                listForCommon = true;
-            }
 
             // Now the common name
             if (filtered.Select(x => x.HostUnicode).Distinct().Count() > 1)
             {
-                // If no bindings have been excluded, we can re-use
-                // the previously printed list
-                if (listForCommon)
-                {
-                    await ListBindings(input, runLevel, filtered);
-                }
                 await InputCommonName(input, filtered, options);
+            }
+
+            var ftpIncluded = filtered.Any(x => x.SiteType == IISSiteType.Ftp);
+            var webIncluded = filtered.Any(x => x.SiteType == IISSiteType.Web);
+            options.IncludeTypes = new List<string>();
+            if (ftpIncluded)
+            {
+                options.IncludeTypes.Add(IISHelper.FtpTypeFilter);
+            }
+            if (webIncluded)
+            {
+                options.IncludeTypes.Add(IISHelper.WebTypeFilter);
             }
             return options;
         }
@@ -252,53 +267,63 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             Func<List<string>?> get,
             Action<List<string>> set)
         {
-            var sorted = SortBindings(filtered).ToList();
-            var raw = default(string);
+            string? raw;
             do
             {
                 raw = await input.RequestString(label);
-                if (!string.IsNullOrEmpty(raw))
-                {
-                    // Magically replace binding identifiers by their proper host names
-                    raw = string.Join(",", raw.ParseCsv().Select(x =>
-                    {
-                        if (int.TryParse(x, out var id))
-                        {
-                            if (id > 0 && id <= sorted.Count())
-                            {
-                                return sorted[id - 1].HostUnicode;
-                            }
-                        }
-                        return x;
-                    }));
-                }
             }
-            while (!ParseHostOptions(raw, allBindings, options, get, set));
+            while (!ProcessInputHosts(raw, allBindings, filtered, options, get, set));
+        }
+
+        /// <summary>
+        /// Allows users to input both the full host name, or the number that
+        /// it's referred to by in the displayed list
+        /// </summary>
+        /// <param name="label"></param>
+        /// <param name="input"></param>
+        /// <param name="allBindings"></param>
+        /// <param name="filtered"></param>
+        /// <param name="options"></param>
+        /// <param name="get"></param>
+        /// <param name="set"></param>
+        /// <returns></returns>
+        bool ProcessInputHosts(
+            string raw,
+            List<IISHelper.IISBindingOption> allBindings,
+            List<IISHelper.IISBindingOption> filtered,
+            IISOptions options,
+            Func<List<string>?> get,
+            Action<List<string>> set)
+        {
+            var sorted = SortBindings(filtered).ToList();
+            if (!string.IsNullOrEmpty(raw))
+            {
+                // Magically replace binding identifiers by their proper host names
+                raw = string.Join(",", raw.ParseCsv()!.Select(x =>
+                {
+                    if (int.TryParse(x, out var id))
+                    {
+                        if (id > 0 && id <= sorted.Count)
+                        {
+                            return sorted[id - 1].HostUnicode;
+                        }
+                    }
+                    return x;
+                }));
+            }
+            return ParseHostOptions(raw, allBindings, options, get, set);
         }
 
         async Task InputCommonName(IInputService input, List<IISHelper.IISBindingOption> filtered, IISOptions options)
         {
             var sorted = SortBindings(filtered).ToList();
-            string raw;
-            do
-            {
-                input.Show(null, "Please pick the most important host name from the list. " +
-                    "This will be displayed to your users as the subject of the certificate.", 
-                    true);
-                raw = await input.RequestString("Common name");
-                if (!string.IsNullOrEmpty(raw))
-                {
-                    // Magically replace binding identifiers by their proper host names
-                    if (int.TryParse(raw, out var id))
-                    {
-                        if (id > 0 && id <= sorted.Count())
-                        {
-                            raw = sorted[id - 1].HostUnicode;
-                        }
-                    }
-                }
-            }
-            while (!ParseCommonName(raw, filtered.Select(x => x.HostUnicode), options));
+            var common = await input.ChooseRequired(
+                "Please pick the main host, which will be presented as the subject of the certificate",
+                sorted,
+                (x) => Choice.Create(x, 
+                        description: x.HostUnicode, 
+                        @default: sorted.IndexOf(x) == 0));
+            ParseCommonName(common.HostUnicode, filtered.Select(x => x.HostUnicode), options);
         }
 
         /// <summary>
@@ -309,13 +334,14 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// <returns></returns>
         async Task InputPattern(IInputService input, IISOptions options)
         {
-            input.Show(null, IISArgumentsProvider.PatternExamples, true);
+            input.CreateSpace();
+            input.Show(null, IISArguments.PatternExamples);
             string raw;
             do
             {
                 raw = await input.RequestString("Pattern");
             }
-            while (!ParsePattern(raw, options));
+            while (!SetPattern(raw, options));
         }
 
         async Task InputRegex(IInputService input, IISOptions options)
@@ -328,27 +354,35 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             while (!ParseRegex(raw, options));
         }
 
-        private bool ParsePattern(string? pattern, IISOptions ret)
+        public static bool ParsePattern(string? pattern, ILogService log)
         {
             if (string.IsNullOrWhiteSpace(pattern))
             {
-                _log.Error("Invalid input");
+                log.Error("Invalid input");
                 return false;
             }
             try
             {
-                var regexString = _iisHelper.PatternToRegex(pattern);
+                var regexString = pattern.PatternToRegex();
                 var actualRegex = new Regex(regexString);
-                ret.IncludePattern = pattern;
                 return true;
-            } 
+            }
             catch (Exception ex)
             {
-                _log.Error(ex, "Unable to convert pattern to regex");
+                log.Error(ex, "Unable to convert pattern to regex");
                 return false;
             }
         }
 
+        private bool SetPattern(string? pattern, IISOptions ret)
+        {
+            if (ParsePattern(pattern, _log))
+            {
+                ret.IncludePattern = pattern;
+                return true;
+            }
+            return false;
+        }
 
         private bool ParseRegex(string? regex, IISOptions options)
         {
@@ -360,7 +394,7 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             try
             {
                 var actualRegex = new Regex(regex);
-                options.IncludeRegex = actualRegex;
+                options.IncludeRegex = regex;
                 return true;
             }
             catch (Exception ex)
@@ -376,7 +410,12 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// </summary>
         /// <param name="bindings"></param>
         /// <returns></returns>
-        private IEnumerable<IISHelper.IISBindingOption> SortBindings(IEnumerable<IISHelper.IISBindingOption> bindings) => bindings.OrderBy(x => x.HostUnicode).ThenBy(x => x.SiteId);
+        private IEnumerable<IISHelper.IISBindingOption> SortBindings(IEnumerable<IISHelper.IISBindingOption> bindings)
+        {
+            return bindings.
+                OrderBy(x => x.HostUnicode, new HostnameSorter(_iisHelper.DomainParser)).
+                ThenBy(x => x.SiteId);
+        }
 
         /// <summary>
         /// List bindings for the user to pick from
@@ -385,86 +424,88 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// <param name="bindings"></param>
         /// <param name="highlight"></param>
         /// <returns></returns>
-        private async Task ListBindings(IInputService input, RunLevel runLevel, List<IISHelper.IISBindingOption> bindings, string? highlight = null)
+        private async Task ListBindings(IInputService input, List<IISHelper.IISBindingOption> bindings, string? highlight = null)
         {
             var sortedBindings = SortBindings(bindings);
             await input.WritePagedList(
                sortedBindings.Select(x => Choice.Create(
                    item: x,
-                   color: BindingColor(x, runLevel, highlight))));
+                   color: BindingColor(x, highlight))));
         }
 
-        private ConsoleColor? BindingColor(IISHelper.IISBindingOption binding, RunLevel runLevel, string? highlight = null)
+        private static ConsoleColor? BindingColor(IISHelper.IISBindingOption binding, string? highlight = null)
         {
-            if (!runLevel.HasFlag(RunLevel.Advanced) && binding.Wildcard)
-            {
-                return ConsoleColor.Red;
-            } 
-            else if (binding.HostUnicode == highlight) 
+            if (binding.HostUnicode == highlight) 
             {
                 return ConsoleColor.Green;
             }
-            else if (binding.Https)
+            else if (binding.Secure)
             {
                 return ConsoleColor.DarkGray;
             }
             else
             {
-                return default(ConsoleColor?);
+                return default;
             }
         }
 
-        public override async Task<IISOptions?> Default()
+        public override async Task<TOptions?> Default()
         {
-            var options = new IISOptions();
-            var args = _arguments.GetArguments<IISArguments>();
-            if (args == null)
-            {
-                return null;
-            }
-            if (string.IsNullOrWhiteSpace(args.Host) && 
-                string.IsNullOrWhiteSpace(args.Pattern) &&
-                string.IsNullOrWhiteSpace(args.Regex) &&
-                string.IsNullOrWhiteSpace(args.SiteId))
+            var options = new TOptions();
+            var host = await Host.GetValue();
+            var pattern = await Pattern.GetValue();
+            var regex = await Regex.GetValue();
+            var siteId = await SiteId.GetValue();
+            var types = await Type.GetValue();
+
+            if (string.IsNullOrWhiteSpace(host) && 
+                string.IsNullOrWhiteSpace(pattern) &&
+                string.IsNullOrWhiteSpace(regex) &&
+                string.IsNullOrWhiteSpace(siteId))
             {
                 // Logically this would be a no-filter run: all 
                 // bindings for all websites. Because the impact
                 // of that can be so high, we want the user to
                 // be explicit about it.
                 _log.Error("You have not specified any filters. If you are sure that you want " +
-                    "to create a certificate for *all* bindings on the server, please specific " +
-                    "-siteid s");
+                    "to create a certificate for *all* bindings on the server, please specify " +
+                    "--siteid s");
                 return null;
             }
 
+            // Host types
+            options.IncludeTypes = types.ParseCsv();
+
+            // Site options
             var allSites = _iisHelper.GetSites(false);
-            if (!ParseSiteOptions(args.SiteId, allSites, options))
+            if (!ParseSiteOptions(siteId, allSites, options))
             {
                 return null;
             }
 
+            // Binding options
             var allBindings = _iisHelper.GetBindings();
-            if (!ParseHostOptions(args.Host, allBindings, options, () => options.IncludeHosts, x => options.IncludeHosts = x))
+            if (!ParseHostOptions(host, allBindings, options, () => options.IncludeHosts, x => options.IncludeHosts = x))
             {
                 return null;
             }
 
             // Pattern
-            if (args.Pattern != null)
+            if (pattern != null)
             {
                 if (options.IncludeHosts != null)
                 {
                     _log.Error("Parameters --host and --host-pattern cannot be combined");
                     return null;
                 }
-                if (!ParsePattern(args.Pattern, options))
+                if (!SetPattern(pattern, options))
                 {
                     return null;
                 }
             }
 
             // Regex
-            if (args.Regex != null)
+            if (regex != null)
             {
                 if (options.IncludeHosts != null)
                 {
@@ -476,27 +517,29 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
                     _log.Error("Parameters --host-pattern and --host-regex cannot be combined");
                     return null;
                 }
-                if (!ParseRegex(args.Regex, options))
+                if (!ParseRegex(regex, options))
                 {
                     return null;
                 }
             }
 
             // Excludes
+            var excludes = await ExcludeBindings.GetValue();
             var filtered = _iisHelper.FilterBindings(allBindings, options);
-            if (options.IncludeHosts == null)
+            if (options.IncludeHosts == null && !string.IsNullOrEmpty(excludes))
             {
-                if (!ParseHostOptions(args.ExcludeBindings, filtered, options, () => options.ExcludeHosts, x => options.ExcludeHosts = x))
+                if (!ParseHostOptions(excludes, filtered, options, () => options.ExcludeHosts, x => options.ExcludeHosts = x))
                 {
                     return null;
                 }
+                filtered = _iisHelper.FilterBindings(allBindings, options);
             }
 
             // Common name
-            filtered = _iisHelper.FilterBindings(allBindings, options);
-            if (args.CommonName != null)
+            var common = await CommonName.GetValue();
+            if (common != null)
             {
-                if (!ParseCommonName(args.CommonName, filtered.Select(x => x.HostUnicode), options))
+                if (!ParseCommonName(common, filtered.Select(x => x.HostUnicode), options))
                 {
                     return null;
                 }
@@ -589,7 +632,7 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             {
                 return true;
             }
-            if (string.Equals(input, "s", StringComparison.CurrentCultureIgnoreCase))
+            if (string.Equals(input, "s", StringComparison.InvariantCultureIgnoreCase))
             {
                 return true;
             }
@@ -597,7 +640,7 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             var identifiers = input.ParseCsv();
             if (identifiers == null)
             {
-                throw new InvalidOperationException();
+                throw new InvalidOperationException("No identifiers found");
             }
 
             var ret = new List<long>();
@@ -625,5 +668,50 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
             options.IncludeSiteIds = ret;
             return true;
         }
+
+        public override IEnumerable<(CommandLineAttribute, object?)> Describe(TOptions options)
+        {
+            // Special case "s"
+            if (string.IsNullOrWhiteSpace(options.IncludePattern) &&
+                string.IsNullOrWhiteSpace(options.IncludeRegex) &&
+                (options.IncludeHosts == null || options.IncludeHosts.Count == 0) &&
+                (options.IncludeSiteIds == null || options.IncludeSiteIds.Count == 0))
+            {
+                yield return (SiteId.Meta, "s");
+                yield break;
+            }
+
+            yield return (Regex.Meta, options.IncludeRegex);
+            yield return (Pattern.Meta, options.IncludePattern);
+            if (options.IncludeTypes != null && 
+                string.Join(",", options.IncludeTypes).ToLower() != "http")
+            {
+                yield return (Type.Meta, options.IncludeTypes);
+            }
+            yield return (Host.Meta, options.IncludeHosts);
+            yield return (CommonName.Meta, options.CommonName);
+            yield return (ExcludeBindings.Meta, options.ExcludeHosts);
+            yield return (SiteId.Meta, options.IncludeSiteIds);
+        }
+    }
+
+    internal class IISOptionsFactory : IISOptionsFactory<IISOptions> 
+    {
+        public IISOptionsFactory(ILogService log, IISHelper iisHelper, MainArguments args, ArgumentsInputService arguments) : base(log, iisHelper, args, arguments) { }
+    }
+
+    internal class IISBindingOptionsFactory : IISOptionsFactory<IISBindingOptions>
+    {
+        public IISBindingOptionsFactory(ILogService log, IISHelper iisHelper, MainArguments args, ArgumentsInputService arguments) : base(log, iisHelper, args, arguments) { }
+    }
+
+    internal class IISSiteOptionsFactory : IISOptionsFactory<IISSiteOptions>
+    {
+        public IISSiteOptionsFactory(ILogService log, IISHelper iisHelper, MainArguments args, ArgumentsInputService arguments) : base(log, iisHelper, args, arguments) { }
+    }
+
+    internal class IISSitesOptionsFactory : IISOptionsFactory<IISSitesOptions>
+    {
+        public IISSitesOptionsFactory(ILogService log, IISHelper iisHelper, MainArguments args, ArgumentsInputService arguments) : base(log, iisHelper, args, arguments) { }
     }
 }

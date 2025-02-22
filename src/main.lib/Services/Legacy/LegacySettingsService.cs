@@ -1,33 +1,37 @@
-﻿using PKISharp.WACS.Configuration;
+﻿using PKISharp.WACS.Configuration.Arguments;
+using PKISharp.WACS.Configuration.Settings;
 using PKISharp.WACS.Services;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Xml;
-using static PKISharp.WACS.Services.SettingsService;
 
 namespace PKISharp.WACS.Host.Services.Legacy
 {
     public class LegacySettingsService : ISettingsService
     {
         private readonly ILogService _log;
-
         public ClientSettings Client { get; private set; } = new ClientSettings();
         public UiSettings UI { get; private set; } = new UiSettings();
         public AcmeSettings Acme { get; private set; } = new AcmeSettings();
+        public ExecutionSettings Execution { get; private set; } = new ExecutionSettings();
         public ProxySettings Proxy { get; private set; } = new ProxySettings();
         public CacheSettings Cache { get; private set; } = new CacheSettings();
         public ScheduledTaskSettings ScheduledTask { get; private set; } = new ScheduledTaskSettings();
         public NotificationSettings Notification { get; private set; } = new NotificationSettings();
         public SecuritySettings Security { get; private set; } = new SecuritySettings();
         public ScriptSettings Script { get; private set; } = new ScriptSettings();
+        public SourceSettings Source { get; private set; } = new SourceSettings();
         public ValidationSettings Validation { get; private set; } = new ValidationSettings();
+        public OrderSettings Order { get; private set; } = new OrderSettings();
+        public CsrSettings Csr { get; private set; } = new CsrSettings();
         public StoreSettings Store { get; private set; } = new StoreSettings();
-        public string ExePath { get; private set; }
-
+        public InstallationSettings Installation { get; private set; } = new InstallationSettings();
+        public SecretsSettings Secrets { get; private set; } = new SecretsSettings();
         public List<string> ClientNames { get; private set; }
-        public Uri BaseUri { get; private set; } 
+        public Uri BaseUri { get; private set; }
+        public bool Valid => true;
 
         public LegacySettingsService(ILogService log, MainArguments main, ISettingsService settings)
         {
@@ -48,7 +52,6 @@ namespace PKISharp.WACS.Host.Services.Legacy
             };
             Validation = settings.Validation;
             Store = settings.Store;
-            ExePath = settings.ExePath;
 
             ClientNames = new List<string>() { 
                 settings.Client.ClientName,
@@ -57,8 +60,8 @@ namespace PKISharp.WACS.Host.Services.Legacy
             };
 
             // Read legacy configuration file
-            var installDir = new FileInfo(ExePath).DirectoryName;
-            var legacyConfig = new FileInfo(Path.Combine(installDir, "settings.config"));
+            var installDir = new FileInfo(VersionService.ExePath).DirectoryName;
+            var legacyConfig = new FileInfo(Path.Combine(installDir!, "settings.config"));
             var userRoot = default(string);
             if (legacyConfig.Exists)
             {
@@ -139,6 +142,6 @@ namespace PKISharp.WACS.Host.Services.Legacy
             _log.Debug("Legacy config folder: {_configPath}", Client.ConfigurationPath);
         }
 
-        public string CleanFileName(string fileName) => Path.GetInvalidFileNameChars().Aggregate(fileName, (current, c) => current.Replace(c.ToString(), string.Empty));
+        public static string CleanFileName(string fileName) => Path.GetInvalidFileNameChars().Aggregate(fileName, (current, c) => current.Replace(c.ToString(), string.Empty));
     }
 }

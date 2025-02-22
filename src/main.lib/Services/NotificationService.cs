@@ -1,28 +1,58 @@
-﻿using PKISharp.WACS.Clients;
+﻿using Autofac;
 using PKISharp.WACS.DomainObjects;
-using System;
+using PKISharp.WACS.Services.Interfaces;
+using Serilog.Events;
+using System.Collections.Generic;
 using System.Linq;
-using System.Net.Mail;
+using System.Threading.Tasks;
 
 namespace PKISharp.WACS.Services
 {
     internal class NotificationService
     {
         private readonly ILogService _log;
-        private readonly ICertificateService _certificateService;
         private readonly ISettingsService _settings;
-        private readonly EmailClient _email;
+        private readonly IEnumerable<INotificationTarget> _targets;
 
         public NotificationService(
+            ILifetimeScope scope,
             ILogService log,
-            ISettingsService setttings,
-            EmailClient email,
-            ICertificateService certificateService)
+            IPluginService pluginService,
+            ISettingsService setttings)
         {
             _log = log;
-            _certificateService = certificateService;
-            _email = email;
             _settings = setttings;
+            _targets = pluginService.
+                GetNotificationTargets().
+                Select(b => scope.Resolve(b.Backend)).
+                OfType<INotificationTarget>().
+                ToList();
+        }
+
+        /// <summary>
+        /// Handle created notification
+        /// </summary>
+        /// <param name="runLevel"></param>
+        /// <param name="renewal"></param>
+        internal async Task NotifyCreated(Renewal renewal, IEnumerable<MemoryEntry> log)
+        {
+            _log.Information(
+                LogType.All, 
+                "Certificate {friendlyName} created", 
+                renewal.LastFriendlyName);
+            if (_settings.Notification.EmailOnSuccess)
+            {
+                foreach (var target in _targets) {
+                    try
+                    {
+                        await target.SendCreated(renewal, log);
+                    } 
+                    catch 
+                    {
+                        _log.Error("Unable to send notification using {n}", target.GetType().Name);
+                    }
+                }
+            }
         }
 
         /// <summary>
@@ -30,16 +60,26 @@ namespace PKISharp.WACS.Services
         /// </summary>
         /// <param name="runLevel"></param>
         /// <param name="renewal"></param>
-        internal void NotifySuccess(RunLevel runLevel, Renewal renewal)
+        internal async Task NotifySuccess(Renewal renewal, IEnumerable<MemoryEntry> log)
         {
-            // Do not send emails when running interactively
-            _log.Information(LogType.All, "Renewal for {friendlyName} succeeded", renewal.LastFriendlyName);
-            if (runLevel.HasFlag(RunLevel.Unattended) && _settings.Notification.EmailOnSuccess)
+            var withErrors = log.Any(l => l.Level == LogEventLevel.Error);
+            _log.Information(
+                LogType.All, 
+                "Renewal for {friendlyName} succeeded" + (withErrors ? " with errors" : ""),
+                renewal.LastFriendlyName);
+            if (withErrors || _settings.Notification.EmailOnSuccess)
             {
-                _email.Send(
-                    "Certificate renewal completed",
-                    $"<p>Certificate <b>{renewal.LastFriendlyName}</b> succesfully renewed.</p> {NotificationInformation(renewal)}",
-                    MailPriority.Low);
+                foreach (var target in _targets)
+                {
+                    try
+                    {
+                        await target.SendSuccess(renewal, log);
+                    }
+                    catch
+                    {
+                        _log.Error("Unable to send notification using {n}", target.GetType().Name);
+                    }
+                }
             }
         }
 
@@ -48,60 +88,55 @@ namespace PKISharp.WACS.Services
         /// </summary>
         /// <param name="runLevel"></param>
         /// <param name="renewal"></param>
-        internal void NotifyFailure(RunLevel runLevel, Renewal renewal, string? errorMessage)
+        internal async Task NotifyFailure(
+            RunLevel runLevel, 
+            Renewal renewal, 
+            RenewResult result,
+            IEnumerable<MemoryEntry> log)
         {
-            // Do not send emails when running interactively       
             _log.Error("Renewal for {friendlyName} failed, will retry on next run", renewal.LastFriendlyName);
+            var errors = result.ErrorMessages?.ToList() ?? new List<string>();
+            errors.AddRange(result.OrderResults?.SelectMany(o => o.ErrorMessages ?? Enumerable.Empty<string>()) ?? Enumerable.Empty<string>());
+            if (errors.Count == 0)
+            {
+                errors.Add("No specific error reason provided.");
+            }
+            errors.ForEach(e => _log.Error(e));
+            
+            // Do not send emails when running interactively      
             if (runLevel.HasFlag(RunLevel.Unattended))
             {
-                _email.Send("Error processing certificate renewal",
-                    $"<p>Renewal for <b>{renewal.LastFriendlyName}</b> failed with error <b>{errorMessage ?? "(null)"}</b>, will retry on next run.</p> {NotificationInformation(renewal)}",
-                    MailPriority.High);
+                foreach (var target in _targets)
+                {
+                    try
+                    {
+                        await target.SendFailure(renewal, log, errors);
+                    }
+                    catch
+                    {
+                        _log.Error("Unable to send notification using {n}", target.GetType().Name);
+                    }
+                }
             }
         }
 
-        private string NotificationInformation(Renewal renewal)
+        /// <summary>
+        /// Handle failure notification
+        /// </summary>
+        /// <param name="runLevel"></param>
+        /// <param name="renewal"></param>
+        internal async Task NotifyTest()
         {
-            try
+            foreach (var target in _targets)
             {
-                var extraMessage = "";
-                extraMessage += $"<p>Hosts: {NotificationHosts(renewal)}</p>";
-                extraMessage += "<p><table><tr><td>Plugins</td><td></td></tr>";
-                extraMessage += $"<tr><td>Target: </td><td> {renewal.TargetPluginOptions.Name}</td></tr>";
-                extraMessage += $"<tr><td>Validation: </td><td> {renewal.ValidationPluginOptions.Name}</td></tr>";
-                if (renewal.CsrPluginOptions != null)
+                try
                 {
-                    extraMessage += $"<tr><td>CSR: </td><td> {renewal.CsrPluginOptions.Name}</td></tr>";
+                    await target.SendTest();
                 }
-                extraMessage += $"<tr><td>Store: </td><td> {string.Join(", ", renewal.StorePluginOptions.Select(x => x.Name))}</td></tr>";
-                extraMessage += $"<tr><td>Installation: </td><td> {string.Join(", ", renewal.InstallationPluginOptions.Select(x => x.Name))}</td></tr>";
-                extraMessage += "</table></p>";
-                return extraMessage;
-            }
-            catch (Exception ex)
-            {
-                _log.Error(ex, "Retrieval of metadata for email failed.");
-                return "";
-            }
-        }
-
-        private string NotificationHosts(Renewal renewal)
-        {
-            try
-            {
-                var cache = _certificateService.CachedInfo(renewal);
-                if (cache == null)
+                catch
                 {
-                    return "Unknown";
+                    _log.Error("Unable to send notification using {n}", target.GetType().Name);
                 }
-                else
-                {
-                    return string.Join(", ", cache.HostNames);
-                }
-            }
-            catch
-            {
-                return "Error";
             }
         }
     }

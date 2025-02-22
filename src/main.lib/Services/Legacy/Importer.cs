@@ -1,18 +1,19 @@
-﻿using PKISharp.WACS.Configuration;
+﻿using PKISharp.WACS.Clients.Acme;
+using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
 using PKISharp.WACS.DomainObjects;
 using PKISharp.WACS.Extensions;
-using PKISharp.WACS.Plugins.Base.Factories.Null;
 using PKISharp.WACS.Plugins.CsrPlugins;
 using PKISharp.WACS.Services.Serialization;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using dns = PKISharp.WACS.Plugins.ValidationPlugins.Dns;
-using http = PKISharp.WACS.Plugins.ValidationPlugins.Http;
-using install = PKISharp.WACS.Plugins.InstallationPlugins;
-using store = PKISharp.WACS.Plugins.StorePlugins;
-using target = PKISharp.WACS.Plugins.TargetPlugins;
+using Dns = PKISharp.WACS.Plugins.ValidationPlugins.Dns;
+using Http = PKISharp.WACS.Plugins.ValidationPlugins.Http;
+using Install = PKISharp.WACS.Plugins.InstallationPlugins;
+using Store = PKISharp.WACS.Plugins.StorePlugins;
+using Target = PKISharp.WACS.Plugins.TargetPlugins;
 
 namespace PKISharp.WACS.Services.Legacy
 {
@@ -22,36 +23,70 @@ namespace PKISharp.WACS.Services.Legacy
         private readonly IRenewalStore _currentRenewal;
         private readonly ILogService _log;
         private readonly ISettingsService _settings;
+        private readonly IInputService _input;
         private readonly TaskSchedulerService _currentTaskScheduler;
         private readonly LegacyTaskSchedulerService _legacyTaskScheduler;
-        private readonly PasswordGenerator _passwordGenerator;
+        private readonly AcmeClientManager _clientManager;
+        private readonly MainArguments _mainArguments;
 
-        public Importer(ILogService log, ILegacyRenewalService legacyRenewal,
+        public Importer(
+            ILogService log, ILegacyRenewalService legacyRenewal,
             ISettingsService settings, IRenewalStore currentRenewal,
+            IInputService input, MainArguments arguments, 
             LegacyTaskSchedulerService legacyTaskScheduler,
             TaskSchedulerService currentTaskScheduler,
-            PasswordGenerator passwordGenerator)
+            AcmeClientManager clientManager)
         {
             _legacyRenewal = legacyRenewal;
             _currentRenewal = currentRenewal;
             _log = log;
             _settings = settings;
+            _input = input;
+            _mainArguments = arguments;
             _currentTaskScheduler = currentTaskScheduler;
             _legacyTaskScheduler = legacyTaskScheduler;
-            _passwordGenerator = passwordGenerator;
+            _clientManager = clientManager;
         }
 
-        public async Task Import()
+        public async Task Import(RunLevel runLevel)
         {
+
+            if (!_legacyRenewal.Renewals.Any())
+            {
+                _log.Warning("No legacy renewals found");
+            }
             _log.Information("Legacy renewals {x}", _legacyRenewal.Renewals.Count().ToString());
             _log.Information("Current renewals {x}", _currentRenewal.Renewals.Count().ToString());
+            _log.Information("Step {x}/3: convert renewals", 1);
             foreach (var legacyRenewal in _legacyRenewal.Renewals)
             {
                 var converted = Convert(legacyRenewal);
                 _currentRenewal.Import(converted);
             }
-            await _currentTaskScheduler.EnsureTaskScheduler(RunLevel.Import);
-            _legacyTaskScheduler.StopTaskScheduler();
+            if (!_mainArguments.NoTaskScheduler)
+            {
+                _log.Information("Step {x}/3: create new scheduled task", 2);
+                await _currentTaskScheduler.EnsureTaskScheduler(runLevel | RunLevel.Import);
+                _legacyTaskScheduler.StopTaskScheduler();
+            }
+
+            _log.Information("Step {x}/3: ensure ACMEv2 account", 3);
+            await _clientManager.GetClient();
+            var listCommand = "--list";
+            var renewCommand = "--renew";
+            if (runLevel.HasFlag(RunLevel.Interactive))
+            {
+                listCommand = "Manage renewals";
+                renewCommand = "Run";
+            }
+            _input.CreateSpace();
+            _input.Show(null,
+                value: $"The renewals have now been imported into this new version " +
+                "of the program. Nothing else will happen until new scheduled task is " +
+                "first run *or* you trigger them manually. It is highly recommended " +
+                $"to review the imported items with '{listCommand}' and to monitor the " +
+                $"results of the first execution with '{renewCommand}'.");
+
         }
 
         public Renewal Convert(LegacyScheduledRenewal legacy)
@@ -60,7 +95,7 @@ namespace PKISharp.WACS.Services.Legacy
             // will be due immediately. That's the ulimate test to see 
             // if they will actually work in the new ACMEv2 environment
 
-            var ret = Renewal.Create(null, _settings.ScheduledTask.RenewalDays, _passwordGenerator);
+            var ret = Renewal.Create();
             ConvertTarget(legacy, ret);
             ConvertValidation(legacy, ret);
             ConvertStore(legacy, ret);
@@ -91,7 +126,7 @@ namespace PKISharp.WACS.Services.Legacy
             switch (legacy.Binding.TargetPluginName.ToLower())
             {
                 case "iisbinding":
-                    var options = new target.IISOptions();
+                    var options = new Target.IISOptions();
                     if (!string.IsNullOrEmpty(legacy.Binding.Host))
                     {
                         options.IncludeHosts = new List<string>() { legacy.Binding.Host };
@@ -104,7 +139,7 @@ namespace PKISharp.WACS.Services.Legacy
                     ret.TargetPluginOptions = options;
                     break;
                 case "iissite":
-                    options = new target.IISOptions();
+                    options = new Target.IISOptions();
                     if (!string.IsNullOrEmpty(legacy.Binding.CommonName))
                     {
                         options.CommonName = legacy.Binding.CommonName.ConvertPunycode();
@@ -118,21 +153,30 @@ namespace PKISharp.WACS.Services.Legacy
                     ret.TargetPluginOptions = options;
                     break;
                 case "iissites":
-                    options = new target.IISOptions();
+                    options = new Target.IISOptions();
                     if (!string.IsNullOrEmpty(legacy.Binding.CommonName))
                     {
                         options.CommonName = legacy.Binding.CommonName.ConvertPunycode();
                     }
-                    options.IncludeSiteIds = legacy.Binding.Host.ParseCsv().Select(x => long.Parse(x)).ToList();
+                    if (!string.IsNullOrEmpty(legacy.Binding.Host))
+                    {
+                        options.IncludeSiteIds = legacy.Binding.Host.ParseCsv()!.Select(x => long.Parse(x)).ToList();
+                    }
                     options.ExcludeHosts = legacy.Binding.ExcludeBindings.ParseCsv();
                     ret.TargetPluginOptions = options;
                     break;
                 case "manual":
-                    ret.TargetPluginOptions = new target.ManualOptions()
+                    var manual = new Target.ManualOptions()
                     {
                         CommonName = string.IsNullOrEmpty(legacy.Binding.CommonName) ? legacy.Binding.Host : legacy.Binding.CommonName.ConvertPunycode(),
                         AlternativeNames = legacy.Binding.AlternativeNames.Select(x => x.ConvertPunycode()).ToList()
                     };
+                    if (!string.IsNullOrEmpty(manual.CommonName) && 
+                        !manual.AlternativeNames.Contains(manual.CommonName))
+                    {
+                        manual.AlternativeNames.Insert(0, manual.CommonName);
+                    }
+                    ret.TargetPluginOptions = manual;
                     break;
             }
         }
@@ -152,7 +196,7 @@ namespace PKISharp.WACS.Services.Legacy
             {
                 case "dns-01.script":
                 case "dns-01.dnsscript":
-                    ret.ValidationPluginOptions = new dns.ScriptOptions()
+                    ret.ValidationPluginOptions = new Dns.ScriptOptions()
                     {
                         CreateScript = legacy.Binding.DnsScriptOptions?.CreateScript,
                         CreateScriptArguments = "{Identifier} {RecordName} {Token}",
@@ -171,7 +215,7 @@ namespace PKISharp.WACS.Services.Legacy
                     };
                     break;
                 case "http-01.ftp":
-                    ret.ValidationPluginOptions = new http.FtpOptions()
+                    ret.ValidationPluginOptions = new CompatibleHttpOptions("bc27d719-dcf2-41ff-bf08-54db7ea49c48")
                     {
                         CopyWebConfig = legacy.Binding.IIS == true,
                         Path = legacy.Binding.WebRootPath,
@@ -179,7 +223,7 @@ namespace PKISharp.WACS.Services.Legacy
                     };
                     break;
                 case "http-01.sftp":
-                    ret.ValidationPluginOptions = new http.SftpOptions()
+                    ret.ValidationPluginOptions = new CompatibleHttpOptions("048aa2e7-2bce-4d3e-b731-6e0ed8b8170d")
                     {
                         CopyWebConfig = legacy.Binding.IIS == true,
                         Path = legacy.Binding.WebRootPath,
@@ -187,7 +231,7 @@ namespace PKISharp.WACS.Services.Legacy
                     };
                     break;
                 case "http-01.webdav":
-                    var options = new http.WebDavOptions()
+                    var options = new CompatibleHttpOptions("7e191d0e-30d1-47b3-ae2e-442499d33e16")
                     {
                         CopyWebConfig = legacy.Binding.IIS == true,
                         Path = legacy.Binding.WebRootPath
@@ -202,18 +246,18 @@ namespace PKISharp.WACS.Services.Legacy
                     break;
                 case "tls-sni-01.iis":
                     _log.Warning("TLS-SNI-01 validation was removed from ACMEv2, changing to SelfHosting. Note that this requires port 80 to be public rather than port 443.");
-                    ret.ValidationPluginOptions = new http.SelfHostingOptions();
+                    ret.ValidationPluginOptions = new Http.SelfHostingOptions();
                     break;
                 case "http-01.iis":
                 case "http-01.selfhosting":
-                    ret.ValidationPluginOptions = new http.SelfHostingOptions()
+                    ret.ValidationPluginOptions = new Http.SelfHostingOptions()
                     {
                         Port = legacy.Binding.ValidationPort
                     };
                     break;
                 case "http-01.filesystem":
                 default:
-                    ret.ValidationPluginOptions = new http.FileSystemOptions()
+                    ret.ValidationPluginOptions = new Http.FileSystemOptions()
                     {
                         CopyWebConfig = legacy.Binding.IIS == true,
                         Path = legacy.Binding.WebRootPath,
@@ -228,7 +272,7 @@ namespace PKISharp.WACS.Services.Legacy
             // Configure store
             if (!string.IsNullOrEmpty(legacy.CentralSslStore))
             {
-                ret.StorePluginOptions.Add(new store.CentralSslOptions()
+                ret.StorePluginOptions.Add(new Store.CentralSslOptions()
                 {
                     Path = legacy.CentralSslStore,
                     KeepExisting = legacy.KeepExisting == true
@@ -236,12 +280,20 @@ namespace PKISharp.WACS.Services.Legacy
             }
             else
             {
-                ret.StorePluginOptions.Add(new store.CertificateStoreOptions()
+                ret.StorePluginOptions.Add(new Store.CertificateStoreOptions()
                 {
                     StoreName = legacy.CertificateStore,
                     KeepExisting = legacy.KeepExisting == true
                 });
             }
+            ret.StorePluginOptions.Add(new Store.PemFilesOptions()
+            {
+                Path = _settings.Cache.Path
+            });
+            ret.StorePluginOptions.Add(new Store.PfxFileOptions()
+            {
+                Path = _settings.Cache.Path
+            });
         }
 
         public void ConvertInstallation(LegacyScheduledRenewal legacy, Renewal ret)
@@ -278,7 +330,7 @@ namespace PKISharp.WACS.Services.Legacy
                 switch (legacyName.ToLower())
                 {
                     case "iis":
-                        ret.InstallationPluginOptions.Add(new install.IISWebOptions()
+                        ret.InstallationPluginOptions.Add(new Install.IISOptions()
                         {
                             SiteId = legacy.Binding.InstallationSiteId,
                             NewBindingIp = legacy.Binding.SSLIPAddress,
@@ -286,7 +338,7 @@ namespace PKISharp.WACS.Services.Legacy
                         });
                         break;
                     case "iisftp":
-                        ret.InstallationPluginOptions.Add(new install.IISFtpOptions()
+                        ret.InstallationPluginOptions.Add(new Install.IISOptions()
                         {
                             SiteId = legacy.Binding.FtpSiteId ?? 
                                 legacy.Binding.InstallationSiteId ?? 
@@ -295,14 +347,14 @@ namespace PKISharp.WACS.Services.Legacy
                         });
                         break;
                     case "manual":
-                        ret.InstallationPluginOptions.Add(new install.ScriptOptions()
+                        ret.InstallationPluginOptions.Add(new Install.ScriptOptions()
                         {
                             Script = legacy.Script,
                             ScriptParameters = legacy.ScriptParameters
                         });
                         break;
                     case "none":
-                        ret.InstallationPluginOptions.Add(new NullInstallationOptions());
+                        ret.InstallationPluginOptions.Add(new Install.NullOptions());
                         break;
                 }
             }

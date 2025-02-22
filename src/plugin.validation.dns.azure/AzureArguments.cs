@@ -1,12 +1,22 @@
-﻿namespace PKISharp.WACS.Plugins.ValidationPlugins
+﻿using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Plugins.Azure.Common;
+using System;
+
+namespace PKISharp.WACS.Plugins.ValidationPlugins
 {
-    public class AzureArguments
+    public class AzureArguments : AzureArgumentsCommon
     {
-        public bool AzureUseMsi { get; set; }
-        public string AzureTenantId { get; set; }
-        public string AzureClientId { get; set; }
-        public string AzureSecret { get; set; }
-        public string AzureSubscriptionId { get; set; }
-        public string AzureResourceGroupName { get; set; }
+        public override string Name => "Azure";
+        public override string Group => "Validation";
+        public override string Condition => "--validation azure";
+
+        [CommandLine(Description = "Subscription ID to login into Microsoft Azure DNS (blank to use default).")]
+        public string? AzureSubscriptionId { get; set; }
+
+        [CommandLine(Description = "The name of the resource group within Microsoft Azure DNS.", Obsolete = true)]
+        public string? AzureResourceGroupName { get; set; }
+
+        [CommandLine(Description = "Hosted zone (blank to find best match)")]
+        public string? AzureHostedZone { get; set; }
     }
 }

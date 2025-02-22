@@ -1,18 +1,13 @@
-﻿using PKISharp.WACS.Plugins.Base;
-using PKISharp.WACS.Plugins.Base.Options;
+﻿using PKISharp.WACS.Plugins.Base.Options;
 using PKISharp.WACS.Services;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 
 namespace PKISharp.WACS.Plugins.TargetPlugins
 {
-    [Plugin("54deb3ee-b5df-4381-8485-fe386054055b")]
-    internal class IISOptions : TargetPluginOptions<IIS>
+    internal class IISOptions : TargetPluginOptions
     {
-        public override string Name => "IIS";
-        public override string Description => "IIS";
-
         /// <summary>
         /// Common name for the certificate
         /// </summary>
@@ -26,7 +21,8 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// <summary>
         /// Regular expression to select hosts
         /// </summary>
-        public Regex? IncludeRegex { get; set; }
+        [JsonConverter(typeof(IISOptionsRegexConverter))]
+        public string? IncludeRegex { get; set; }
 
         /// <summary>
         /// Filter by hostname
@@ -37,6 +33,11 @@ namespace PKISharp.WACS.Plugins.TargetPlugins
         /// Excluded bindings (additional filter)
         /// </summary>
         public List<string>? ExcludeHosts { get; set; }
+
+        /// <summary>
+        /// Which types of bindings to consider
+        /// </summary>
+        public List<string>? IncludeTypes { get; set; }
 
         /// <summary>
         /// Site ids to include in the selection

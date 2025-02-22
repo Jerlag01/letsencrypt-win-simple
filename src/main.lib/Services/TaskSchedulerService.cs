@@ -1,5 +1,5 @@
 ﻿using Microsoft.Win32.TaskScheduler;
-using PKISharp.WACS.Configuration;
+using PKISharp.WACS.Configuration.Arguments;
 using PKISharp.WACS.Extensions;
 using System;
 using System.IO;
@@ -17,46 +17,46 @@ namespace PKISharp.WACS.Services
 
         public TaskSchedulerService(
             ISettingsService settings,
-            IArgumentsService arguments,
+            MainArguments arguments,
             IInputService input,
             ILogService log)
         {
-            _arguments = arguments.MainArguments;
+            _arguments = arguments;
             _settings = settings;
             _input = input;
             _log = log;
         }
-        private string TaskName(string clientName) => $"{clientName} renew ({_settings.BaseUri.CleanUri()})";
-        private string WorkingDirectory => Path.GetDirectoryName(_settings.ExePath);
-        private string ExecutingFile => Path.GetFileName(_settings.ExePath);
+        private string TaskName => $"{_settings.Client.ClientName.CleanPath()} renew ({_settings.BaseUri.CleanUri()})";
+        private static string WorkingDirectory => Path.GetDirectoryName(VersionService.ExePath) ?? "";
+        private static string ExecutingFile => Path.GetFileName(VersionService.ExePath);
 
         private Task? ExistingTask
         {
             get
             {
-                using (var taskService = new TaskService())
-                {
-                    var taskName = TaskName(_settings.Client.ClientName);
-                    var existingTask = taskService.GetTask(taskName);
-                    if (existingTask != null)
-                    {
-                        return existingTask;
-                    }
-                }
-                return null;
+                using var taskService = new TaskService();
+                return taskService.GetTask(TaskName);
             }
         }
 
         public bool ConfirmTaskScheduler()
         {
-            var existingTask = ExistingTask;
-            if (existingTask != null)
+            try
             {
-                return IsHealthy(existingTask);
-            }
-            else
+                var existingTask = ExistingTask;
+                if (existingTask != null)
+                {
+                    return IsHealthy(existingTask);
+                }
+                else
+                {
+                    _log.Warning("Scheduled task not configured yet");
+                    return false;
+                }
+            } 
+            catch (Exception ex)
             {
-                _log.Warning("Scheduled task not configured yet");
+                _log.Error(ex, "Scheduled task health check failed");
                 return false;
             }
         }
@@ -64,18 +64,68 @@ namespace PKISharp.WACS.Services
         private bool IsHealthy(Task task)
         {
             var healthy = true;
-            if (!task.Definition.Actions.OfType<ExecAction>().Any(action => 
-                action.Path == _settings.ExePath && 
-                action.WorkingDirectory == WorkingDirectory))
+            var action = task.Definition.Actions.OfType<ExecAction>().
+                Where(action => string.Equals(action.Path?.Trim('"'), VersionService.ExePath, StringComparison.OrdinalIgnoreCase)).
+                Where(action => string.Equals(action.WorkingDirectory?.Trim('"'), WorkingDirectory, StringComparison.OrdinalIgnoreCase)).
+                FirstOrDefault();
+            var trigger = task.Definition.Triggers.FirstOrDefault();
+            if (action == null)
             {
                 healthy = false;
-                _log.Warning("Scheduled task points to different location");
+                _log.Warning("Scheduled task points to different location for .exe and/or working directory");
+            } 
+            else
+            {
+                var filtered = action.Arguments.Replace("--verbose", "").Trim();
+                if (!string.Equals(filtered, Arguments, StringComparison.OrdinalIgnoreCase))
+                {
+                    healthy = false;
+                    _log.Warning("Scheduled task arguments do not match with expected value");
+                }
+            }
+            if (trigger == null)
+            {
+                healthy = false;
+                _log.Warning("Scheduled task doesn't have a trigger configured");
+            }
+            else
+            {
+                if (!trigger.Enabled)
+                {
+                    healthy = false;
+                    _log.Warning("Scheduled task trigger is disabled");
+                }
+                if (trigger is DailyTrigger dt)
+                {
+                    if (dt.StartBoundary.TimeOfDay != _settings.ScheduledTask.StartBoundary)
+                    {
+                        healthy = false;
+                        _log.Warning("Scheduled task start time mismatch");
+                    }
+                    if (dt.RandomDelay != _settings.ScheduledTask.RandomDelay)
+                    {
+                        healthy = false;
+                        _log.Warning("Scheduled task random delay mismatch");
+                    }
+                } 
+                else
+                {
+                    healthy = false;
+                    _log.Warning("Scheduled task trigger is not daily");
+                }
+            }
+            if (task.Definition.Settings.ExecutionTimeLimit != _settings.ScheduledTask.ExecutionTimeLimit)
+            {
+                healthy = false;
+                _log.Warning("Scheduled task execution time limit mismatch");
             }
             if (!task.Enabled)
             {
                 healthy = false;
                 _log.Warning("Scheduled task is disabled");
             }
+
+            // Report final result
             if (healthy)
             {
                 _log.Information("Scheduled task looks healthy");
@@ -88,39 +138,60 @@ namespace PKISharp.WACS.Services
             }
         }
 
+        /// <summary>
+        /// Arguments that are supposed to be passed to wacs.exe when the
+        /// scheduled task runs
+        /// </summary>
+        private string Arguments => 
+            $"--{nameof(MainArguments.Renew).ToLowerInvariant()} " +
+            $"--{nameof(MainArguments.BaseUri).ToLowerInvariant()} " +
+            $"\"{_settings.BaseUri}\"";
+
+        /// <summary>
+        /// Decide to (re)create scheduled task or not
+        /// </summary>
+        /// <param name="runLevel"></param>
+        /// <returns></returns>
         public async System.Threading.Tasks.Task EnsureTaskScheduler(RunLevel runLevel)
         {
-            string taskName;
             var existingTask = ExistingTask;
+            var create = runLevel.HasFlag(RunLevel.Force) || existingTask == null;
+            if (!create && existingTask != null && !IsHealthy(existingTask))
+            {
+                if (runLevel.HasFlag(RunLevel.Interactive))
+                {
+                    create = await _input.PromptYesNo($"Do you want to replace the existing task?", false);
+                }
+                else
+                {
+                    _log.Error("Proceeding with unhealthy scheduled task, automatic renewals may not work until this is addressed");
+                }
+            }
+            if (create)
+            {
+                await CreateTaskScheduler(runLevel);
+            }
+        }
 
-            taskName = existingTask != null ? 
-                existingTask.Name : 
-                TaskName(_settings.Client.ClientName);
-
+        /// <summary>
+        /// (Re)create the scheduled task
+        /// </summary>
+        /// <param name="runLevel"></param>
+        /// <returns></returns>
+        public async System.Threading.Tasks.Task CreateTaskScheduler(RunLevel runLevel)
+        {
             using var taskService = new TaskService();
+            var existingTask = ExistingTask;
             if (existingTask != null)
             {
-                var healthy = IsHealthy(existingTask);
-                if (healthy && !runLevel.HasFlag(RunLevel.Advanced))
-                {
-                    return;
-                }
-
-                if (!await _input.PromptYesNo($"Do you want to replace the existing task?", false))
-                {
-                    return;
-                }
-
-                _log.Information("Deleting existing task {taskName} from Windows Task Scheduler.", taskName);
-                taskService.RootFolder.DeleteTask(taskName, false);
+                _log.Information("Deleting existing task {taskName} from Windows Task Scheduler.", TaskName);
+                taskService.RootFolder.DeleteTask(TaskName, false);
             }
-
-            var actionString = $"--{nameof(MainArguments.Renew).ToLowerInvariant()} --{nameof(MainArguments.BaseUri).ToLowerInvariant()} \"{_settings.BaseUri}\"";
-
-            _log.Information("Adding Task Scheduler entry with the following settings", taskName);
-            _log.Information("- Name {name}", taskName);
+          
+            _log.Information("Adding Task Scheduler entry with the following settings", TaskName);
+            _log.Information("- Name {name}", TaskName);
             _log.Information("- Path {action}", WorkingDirectory);
-            _log.Information("- Command {exec} {action}", ExecutingFile, actionString);
+            _log.Information("- Command {exec} {action}", ExecutingFile, Arguments);
             _log.Information("- Start at {start}", _settings.ScheduledTask.StartBoundary);
             if (_settings.ScheduledTask.RandomDelay.TotalMinutes > 0)
             {
@@ -152,7 +223,13 @@ namespace PKISharp.WACS.Services
             task.Settings.StartWhenAvailable = true;
 
             // Create an action that will launch the app with the renew parameters whenever the trigger fires
-            task.Actions.Add(new ExecAction(_settings.ExePath, actionString, WorkingDirectory));
+            var actionPath = VersionService.ExePath;
+            if (actionPath.IndexOf(" ") > -1)
+            {
+                actionPath = $"\"{actionPath}\"";
+            }
+            var workingPath = WorkingDirectory;
+            _ = task.Actions.Add(new ExecAction(actionPath, Arguments, workingPath));
 
             task.Principal.RunLevel = TaskRunLevel.Highest;
             while (true)
@@ -160,7 +237,7 @@ namespace PKISharp.WACS.Services
                 try
                 {
                     if (!_arguments.UseDefaultTaskUser &&
-                        runLevel.HasFlag(RunLevel.Advanced) &&
+                        runLevel.HasFlag(RunLevel.Interactive | RunLevel.Advanced) &&
                         await _input.PromptYesNo($"Do you want to specify the user the task will run as?", false))
                     {
                         // Ask for the login and password to allow the task to run 
@@ -170,7 +247,7 @@ namespace PKISharp.WACS.Services
                         try
                         {
                             taskService.RootFolder.RegisterTaskDefinition(
-                                taskName,
+                                TaskName,
                                 task,
                                 TaskCreation.Create,
                                 username,
@@ -197,7 +274,7 @@ namespace PKISharp.WACS.Services
                         try
                         {
                             taskService.RootFolder.RegisterTaskDefinition(
-                                taskName,
+                                TaskName,
                                 task,
                                 TaskCreation.CreateOrUpdate,
                                 username,
@@ -217,7 +294,7 @@ namespace PKISharp.WACS.Services
                         try
                         {
                             taskService.RootFolder.RegisterTaskDefinition(
-                                taskName,
+                                TaskName,
                                 task,
                                 TaskCreation.CreateOrUpdate,
                                 null,

@@ -1,35 +1,17 @@
-﻿using ACMESharp.Protocol;
-using PKISharp.WACS.DomainObjects;
+﻿using PKISharp.WACS.DomainObjects;
 using PKISharp.WACS.Plugins.Interfaces;
 using PKISharp.WACS.Services;
-using System;
-using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
+using PKISharp.WACS.UnitTests.Tests.CertificateInfoTests;
 using System.Threading.Tasks;
 
 namespace PKISharp.WACS.UnitTests.Mock.Services
 {
     internal class CertificateService : ICertificateService
     {
-        public CertificateInfo CachedInfo(Renewal renewal, Target target = null) => null;
-        public void Delete(Renewal renewal) => throw new NotImplementedException();
-
-        public void Encrypt() { }
-
-        public Task<CertificateInfo> RequestCertificate(ICsrPlugin csrPlugin, RunLevel runLevel, Renewal renewal, Target target, OrderDetails order)
+        public Task<ICertificateInfo> RequestCertificate(ICsrPlugin? csrPlugin, Order order)
         {
             // Create self-signed certificate
-            var ecdsa = ECDsa.Create(); // generate asymmetric key pair
-            var req = new CertificateRequest($"CN={target.CommonName}", ecdsa, HashAlgorithmName.SHA256);
-            var cert = req.CreateSelfSigned(DateTimeOffset.Now, DateTimeOffset.Now.AddYears(5));
-            return Task.FromResult(new CertificateInfo(cert)
-            {
-                CacheFile = null,
-                CacheFilePassword = null,
-                Certificate = cert,
-            });
+            return Task.FromResult<ICertificateInfo>(CertificateInfoTests.CloudFlare());
         }
-
-        public Task RevokeCertificate(Renewal renewal) => Task.CompletedTask;
     }
 }
