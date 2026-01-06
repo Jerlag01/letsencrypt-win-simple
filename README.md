@@ -1,18 +1,56 @@
-# Windows ACME Simple (WACS)
-A simple ACME client for Windows - for use with Let's Encrypt. (Formerly known as letsencrypt-win-simple (LEWS))
+<a href="https://zerossl.com">
+<picture>
+  <!-- Dark mode -->
+  <source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://github.com/win-acme/win-acme/blob/master/win-acme_banner_rounded_dark.png" />
+  <!-- Light mode -->
+  <source
+    media="(prefers-color-scheme: light)"
+    srcset="https://github.com/win-acme/win-acme/blob/master/win-acme_banner_rounded_light.png" />
+  <!-- Fallback for environments without media queries -->
+  <img
+    alt="ZeroSSL"
+    src="https://github.com/win-acme/win-acme/blob/master/win-acme_banner_rounded_light.png"
+    height="auto" />
+</picture>
+</a>
 
-[![Build status](https://ci.appveyor.com/api/projects/status/c4b3t6g82yyjl4v1?svg=true)](https://ci.appveyor.com/project/WouterTinus/win-acme-s8t9q)
+# win-acme
 
-# Overview
-Please check our [website](https://www.win-acme.com/) for an up-to-date overview, documentation and downloads.
+This is a ACMEv2 client for Windows that aims to be very simple to start with, but powerful enough to grow into almost every scenario.
 
-![Screenshot](https://win-acme.com/assets/screenshot.png)
+* A very simple interface to create and install certificates on a local IIS server
+* A more advanced interface for many other use cases, including Apache and Exchange
+* Automatically creates a scheduled task to renew certificates when needed
+* Get certificates with wildcards (*.example.com), international names (证书.example.com), OCSP Must Staple extension (optional).
+* Re-use private keys for DANE, use EC crypto or bring your own CSR
+* Advanced toolkit for DNS, HTTP and TLS validation: SFTP/FTPS, acme-dns, Azure, Route53, Cloudflare and many more…
+* Store your certificates where and how you want them: Windows, IIS Central Store, .pem files, .pfx file or KeyVault
+* Compatible with all popular ACME services, including Let’s Encrypt, ZeroSSL, DigiCert, Sectigo, Buypass, Keyon and others…
+* Completely unattended operation from the command line
+* Other forms of automation through manipulation of .json files
+* Write your own Powershell .ps1 scripts to handle installation and validation
+* Build your own plugins with C#
 
-# Community support
-If you run into trouble you can open an [issue](https://github.com/win-acme/win-acme/issues). First please check to see if your issue is covered in the [manual](https://www.win-acme.com/manual/getting-started) or [reference](https://www.win-acme.com/reference/cli). If you can't find a solition that way, describe the exact steps that you are taking and try to provide as much relevant information as possible, preferably including logging.
+## Getting started
+Download the .zip file from the download menu, unpack it to a location on your hard disk and run `wacs.exe`.
+Alternatively install .NET Core, run `dotnet tool install win-acme --global` and then `wacs.exe`.
 
-# Professional support / sponsorship
-Is your business relying on this program to secure customer websites and perhaps even critical infrastructure? Then maybe it would be good for your peace of mind then to sponsor one of its core developers, to gain guaranteed future support and good karma at the same time. I offer my help quickly, discreetly and professionally via [Patreon](https://www.patreon.com/woutertinus).
+## Getting help
+If you require assistance please check the manual first before looking for support.
 
-# Donations
-Do you like the program and want to buy me a beer and discuss the future of the program in private? My [Patreon](https://www.patreon.com/woutertinus) also has some simple "Thank you" tiers, or if you prefer to do a one-time donation you can use [Paypal](http://paypal.me/woutertinus).
+
+## About this repository
+> [!NOTE]
+> This repository is officially maintained by <strong>ZeroSSL</strong> as part of our commitment to secure and reliable SSL/TLS solutions. We welcome contributions and feedback from the community!  
+> For more information about our services, including free and paid SSL/TLS certificates, visit https://zerossl.com.
+<p align="center">
+	<a href="https://zerossl.com.com">
+		<picture>
+			<source media="(prefers-color-scheme: dark)" srcset="https://zerossl.com/assets/images/zerossl_logo_white.svg">
+			<source media="(prefers-color-scheme: light)" srcset="https://zerossl.com/assets/images/zerossl_logo.svg">
+			<img src="https://zerossl.com/assets/images/zerossl_logo.svg" alt="ZeroSSL" width="256">
+		</picture>
+	</a>
+</p>
